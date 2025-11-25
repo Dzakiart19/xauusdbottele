@@ -25,6 +25,7 @@ class SignalSession:
     trade_id: Optional[int]
     started_at: datetime
     chart_path: Optional[str] = None
+    photo_sent: bool = False  # Track if photo already sent to prevent duplicates
 
 class SignalSessionManager:
     """
@@ -133,13 +134,24 @@ class SignalSessionManager:
             return True
     
     async def end_session(self, user_id: int, reason: str = "closed"):
-        """Akhiri sesi sinyal"""
+        """Akhiri sesi sinyal dan cleanup chart jika ada"""
         async with self._session_lock:
             if user_id not in self.active_sessions:
                 logger.debug(f"No active session to end for user {user_id}")
                 return None
             
             session = self.active_sessions[user_id]
+            
+            # Cleanup chart file if exists
+            if session.chart_path:
+                try:
+                    import os
+                    if os.path.exists(session.chart_path):
+                        os.remove(session.chart_path)
+                        logger.info(f"🗑️ Cleaned up session chart: {session.chart_path}")
+                except Exception as e:
+                    logger.warning(f"Failed to cleanup chart {session.chart_path}: {e}")
+            
             del self.active_sessions[user_id]
             
             duration = (datetime.now(pytz.UTC) - session.started_at).total_seconds()

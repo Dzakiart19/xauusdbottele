@@ -579,10 +579,6 @@ class TradingBot:
                     logger.warning(f"Connection error dalam monitoring loop: {e}, retry in {retry_delay}s")
                     await asyncio.sleep(retry_delay)
                     retry_delay = min(retry_delay * 2, max_retry_delay)
-                except TimeoutError as e:
-                    logger.warning(f"Timeout error dalam monitoring loop: {e}, retry in {retry_delay}s")
-                    await asyncio.sleep(retry_delay)
-                    retry_delay = min(retry_delay * 2, max_retry_delay)
                 except Exception as e:
                     logger.error(f"Error processing tick dalam monitoring loop: {type(e).__name__}: {e}")
                     await asyncio.sleep(retry_delay)
@@ -677,7 +673,7 @@ class TradingBot:
     async def _send_signal(self, user_id: int, chat_id: int, signal: dict, df: Optional[pd.DataFrame] = None):
         """Send trading signal with enhanced error handling and validation"""
         try:
-            if not validate_user_id(user_id):
+            if not validate_chat_id(user_id):
                 logger.error(f"Invalid user_id: {user_id}")
                 return
             
@@ -774,28 +770,49 @@ class TradingBot:
                             logger.error(f"Fallback message also failed: {fallback_error}")
                     
                     if df is not None and len(df) >= 30:
-                        try:
-                            chart_path = await asyncio.wait_for(
-                                self.chart_generator.generate_chart_async(df, signal, signal['timeframe']),
-                                timeout=45.0
-                            )
-                            
-                            if chart_path:
-                                try:
-                                    await self._send_telegram_photo(chat_id, chart_path, timeout=60.0)
-                                except (TimedOut, NetworkError, TelegramError) as e:
-                                    logger.warning(f"Failed to send chart: {e}. Signal sent successfully.")
-                                finally:
-                                    if self.config.CHART_AUTO_DELETE:
-                                        await asyncio.sleep(2)
-                                        self.chart_generator.delete_chart(chart_path)
-                                        logger.debug(f"Auto-deleted chart: {chart_path}")
-                            else:
-                                logger.warning(f"Chart generation returned None for {signal['signal']} signal")
-                        except asyncio.TimeoutError:
-                            logger.warning("Chart generation timeout - signal sent without chart")
-                        except Exception as e:
-                            logger.warning(f"Chart generation/send failed: {e}. Signal sent successfully.")
+                        # Check if photo already sent for this session (prevent duplicates)
+                        photo_already_sent = False
+                        if self.signal_session_manager:
+                            session_data = self.signal_session_manager.get_active_session(user_id)
+                            if session_data and session_data.photo_sent:
+                                photo_already_sent = True
+                                logger.debug(f"Photo already sent for user {mask_user_id(user_id)}, skipping duplicate")
+                        
+                        if not photo_already_sent:
+                            try:
+                                chart_path = await asyncio.wait_for(
+                                    self.chart_generator.generate_chart_async(df, signal, signal['timeframe']),
+                                    timeout=45.0
+                                )
+                                
+                                if chart_path:
+                                    try:
+                                        await self._send_telegram_photo(chat_id, chart_path, timeout=60.0)
+                                        # Mark photo as sent in session to prevent duplicates
+                                        if self.signal_session_manager:
+                                            await self.signal_session_manager.update_session(
+                                                user_id, 
+                                                photo_sent=True,
+                                                chart_path=chart_path
+                                            )
+                                        logger.info(f"📸 Chart sent successfully for user {mask_user_id(user_id)}")
+                                    except (TimedOut, NetworkError, TelegramError) as e:
+                                        logger.warning(f"Failed to send chart: {e}. Signal sent successfully.")
+                                        # Still mark as attempted to prevent retry spam
+                                        if self.signal_session_manager:
+                                            await self.signal_session_manager.update_session(user_id, photo_sent=True)
+                                    finally:
+                                        # Chart cleanup handled by session end, but also auto-delete if enabled
+                                        if self.config.CHART_AUTO_DELETE and not self.signal_session_manager:
+                                            await asyncio.sleep(2)
+                                            self.chart_generator.delete_chart(chart_path)
+                                            logger.debug(f"Auto-deleted chart: {chart_path}")
+                                else:
+                                    logger.warning(f"Chart generation returned None for {signal['signal']} signal")
+                            except asyncio.TimeoutError:
+                                logger.warning("Chart generation timeout - signal sent without chart")
+                            except Exception as e:
+                                logger.warning(f"Chart generation/send failed: {e}. Signal sent successfully.")
                     else:
                         logger.debug(f"Skipping chart - insufficient candles ({len(df) if df is not None else 0}/30)")
                 

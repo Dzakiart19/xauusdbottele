@@ -376,7 +376,40 @@ def setup_default_tasks(scheduler: TaskScheduler, bot_components: Dict):
     scheduler.add_interval_task(
         'cleanup_charts',
         cleanup_old_charts,
-        interval_seconds=3600
+        interval_seconds=1800  # 30 menit untuk Koyeb free tier optimization
+    )
+    
+    async def aggressive_chart_cleanup():
+        """Aggressive cleanup untuk Koyeb free tier - batasi jumlah file chart"""
+        chart_generator = bot_components.get('chart_generator')
+        if chart_generator:
+            import os
+            chart_dir = chart_generator.chart_dir
+            max_charts = 30  # Maximum charts untuk Koyeb free tier
+            
+            try:
+                if os.path.exists(chart_dir):
+                    files = sorted(
+                        [f for f in os.listdir(chart_dir) if f.endswith('.png')],
+                        key=lambda x: os.path.getmtime(os.path.join(chart_dir, x))
+                    )
+                    
+                    if len(files) > max_charts:
+                        files_to_delete = files[:len(files) - max_charts]
+                        for f in files_to_delete:
+                            try:
+                                os.remove(os.path.join(chart_dir, f))
+                                logger.debug(f"Deleted excess chart: {f}")
+                            except Exception as e:
+                                logger.warning(f"Failed to delete chart {f}: {e}")
+                        logger.info(f"Aggressive cleanup: removed {len(files_to_delete)} old charts")
+            except Exception as e:
+                logger.error(f"Error in aggressive chart cleanup: {e}")
+    
+    scheduler.add_interval_task(
+        'aggressive_chart_cleanup',
+        aggressive_chart_cleanup,
+        interval_seconds=600  # 10 menit
     )
     
     scheduler.add_daily_task(
