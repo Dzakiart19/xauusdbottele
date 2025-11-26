@@ -1,6 +1,7 @@
 import asyncio
+from collections import defaultdict
 from datetime import datetime
-from typing import Dict, Optional, Tuple, Set
+from typing import Dict, Optional, Tuple, Set, Callable, Any
 import pytz
 from telegram.error import TimedOut
 from bot.logger import setup_logger
@@ -13,6 +14,7 @@ DEFAULT_OPERATION_TIMEOUT = 30.0
 NOTIFICATION_TIMEOUT = 10.0
 FALLBACK_NOTIFICATION_TIMEOUT = 5.0
 TICK_QUEUE_TIMEOUT = 5.0
+TASK_CLEANUP_TIMEOUT = 10.0
 
 class PositionError(Exception):
     """Base exception for position tracking errors"""
@@ -70,6 +72,14 @@ def validate_position_data(user_id: int, trade_id: int, signal_type: str,
         return False, f"Validation error: {str(e)}"
 
 class PositionTracker:
+    """Position tracker with async task lifecycle management.
+    
+    Task Lifecycle Tracking:
+    - All spawned tasks are registered in _pending_tasks set
+    - Done callbacks automatically remove completed tasks and drain exceptions
+    - wait_for_completion() allows waiting for all tasks to finish
+    - SignalSessionManager states are resolved on task completion
+    """
     MAX_SLIPPAGE_PIPS = 5.0
     
     def __init__(self, config, db_manager, risk_manager, alert_system=None, user_manager=None, 
@@ -89,20 +99,158 @@ class PositionTracker:
         self._position_lock = asyncio.Lock()
         self._pending_tasks: Set[asyncio.Task] = set()
         self._shutdown_event = asyncio.Event()
+        self._completion_event = asyncio.Event()
+        self._monitoring_task: Optional[asyncio.Task] = None
+        self._task_callbacks: Dict[str, Callable] = {}
+        self._task_results: Dict[str, Any] = {}
     
-    def _create_tracked_task(self, coro, name: str = None) -> asyncio.Task:
-        """Create a task and track it for proper cleanup on shutdown"""
+    def _on_task_done(self, task: asyncio.Task, task_name: str = None) -> None:
+        """Callback invoked when a tracked task completes.
+        
+        Handles:
+        - Exception draining and logging
+        - Task removal from pending set
+        - SignalSessionManager state resolution if applicable
+        - Custom callback execution
+        """
+        try:
+            self._pending_tasks.discard(task)
+            
+            if task.cancelled():
+                logger.debug(f"Task {task_name or task.get_name()} was cancelled")
+                return
+            
+            exception = task.exception() if not task.cancelled() else None
+            if exception:
+                logger.error(f"Task {task_name or task.get_name()} raised exception: {exception}", exc_info=exception)
+                if self.alert_system:
+                    try:
+                        asyncio.create_task(
+                            self.alert_system.send_system_error(
+                                f"Task Error: {task_name or task.get_name()}\n"
+                                f"Exception: {type(exception).__name__}: {str(exception)}"
+                            )
+                        )
+                    except Exception as alert_err:
+                        logger.error(f"Failed to send task error alert: {alert_err}")
+            else:
+                result = task.result()
+                if task_name:
+                    self._task_results[task_name] = result
+                logger.debug(f"Task {task_name or task.get_name()} completed successfully")
+            
+            if task_name and task_name in self._task_callbacks:
+                try:
+                    callback = self._task_callbacks.pop(task_name)
+                    callback(task)
+                except Exception as cb_err:
+                    logger.error(f"Task callback error for {task_name}: {cb_err}")
+            
+            if len(self._pending_tasks) == 0:
+                self._completion_event.set()
+                
+        except asyncio.InvalidStateError:
+            pass
+        except Exception as e:
+            logger.error(f"Error in task done callback: {e}")
+    
+    def _create_tracked_task(self, coro, name: str = None, 
+                             on_complete: Callable = None,
+                             resolve_session_user_id: int = None) -> asyncio.Task:
+        """Create a task and track it for proper cleanup on shutdown.
+        
+        Args:
+            coro: Coroutine to execute
+            name: Optional task name for identification
+            on_complete: Optional callback when task completes
+            resolve_session_user_id: If set, resolve SignalSessionManager for this user on completion
+            
+        Returns:
+            asyncio.Task: The created and tracked task
+        """
         task = asyncio.create_task(coro, name=name)
         self._pending_tasks.add(task)
-        task.add_done_callback(self._pending_tasks.discard)
+        self._completion_event.clear()
+        
+        if on_complete:
+            self._task_callbacks[name or task.get_name()] = on_complete
+        
+        def done_callback(t: asyncio.Task):
+            self._on_task_done(t, name)
+            
+            if resolve_session_user_id and self.signal_session_manager:
+                try:
+                    if not t.cancelled() and t.exception() is None:
+                        asyncio.create_task(
+                            self._resolve_session_state(resolve_session_user_id)
+                        )
+                except Exception as e:
+                    logger.error(f"Error resolving session state: {e}")
+        
+        task.add_done_callback(done_callback)
         return task
     
-    async def _cancel_pending_tasks(self):
-        """Cancel all pending tasks with proper cleanup"""
-        if not self._pending_tasks:
+    async def _resolve_session_state(self, user_id: int) -> None:
+        """Resolve SignalSessionManager state after task completion."""
+        if not self.signal_session_manager:
             return
         
-        logger.info(f"Cancelling {len(self._pending_tasks)} pending tasks...")
+        try:
+            async with self._position_lock:
+                has_active = user_id in self.active_positions and len(self.active_positions[user_id]) > 0
+            
+            if not has_active:
+                session = self.signal_session_manager.get_session(user_id)
+                if session and session.get('status') == 'monitoring':
+                    logger.info(f"Resolving orphaned session state for user {user_id}")
+                    await self.signal_session_manager.end_session(user_id, 'RESOLVED')
+        except Exception as e:
+            logger.error(f"Error resolving session state for user {user_id}: {e}")
+    
+    async def wait_for_completion(self, timeout: float = None) -> bool:
+        """Wait for all pending tasks to complete.
+        
+        Args:
+            timeout: Maximum time to wait in seconds. None means wait indefinitely.
+            
+        Returns:
+            bool: True if all tasks completed, False if timeout occurred
+        """
+        if not self._pending_tasks:
+            return True
+        
+        logger.info(f"Waiting for {len(self._pending_tasks)} pending tasks to complete...")
+        
+        try:
+            if timeout:
+                await asyncio.wait_for(self._completion_event.wait(), timeout=timeout)
+            else:
+                await self._completion_event.wait()
+            return True
+        except asyncio.TimeoutError:
+            logger.warning(f"Timeout waiting for task completion. {len(self._pending_tasks)} tasks still pending")
+            return False
+    
+    def get_pending_task_count(self) -> int:
+        """Get the number of pending tasks."""
+        return len(self._pending_tasks)
+    
+    def get_pending_task_names(self) -> list:
+        """Get names of all pending tasks."""
+        return [t.get_name() for t in self._pending_tasks]
+    
+    async def _cancel_pending_tasks(self, timeout: float = TASK_CLEANUP_TIMEOUT):
+        """Cancel all pending tasks with proper cleanup.
+        
+        Args:
+            timeout: Maximum time to wait for task cancellation
+        """
+        if not self._pending_tasks:
+            logger.info("No pending tasks to cancel")
+            return
+        
+        task_count = len(self._pending_tasks)
+        logger.info(f"Cancelling {task_count} pending tasks...")
         
         tasks_to_cancel = list(self._pending_tasks)
         for task in tasks_to_cancel:
@@ -110,15 +258,43 @@ class PositionTracker:
                 task.cancel()
         
         if tasks_to_cancel:
-            results = await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
-            for task, result in zip(tasks_to_cancel, results):
-                if isinstance(result, asyncio.CancelledError):
-                    logger.debug(f"Task {task.get_name()} cancelled successfully")
-                elif isinstance(result, Exception):
-                    logger.warning(f"Task {task.get_name()} raised exception during cancel: {result}")
+            try:
+                done, pending = await asyncio.wait(
+                    tasks_to_cancel,
+                    timeout=timeout,
+                    return_when=asyncio.ALL_COMPLETED
+                )
+                
+                completed = len(done)
+                still_pending = len(pending)
+                
+                for task in done:
+                    try:
+                        if task.cancelled():
+                            logger.debug(f"Task {task.get_name()} cancelled successfully")
+                        elif task.exception():
+                            logger.warning(f"Task {task.get_name()} raised exception during cancel: {task.exception()}")
+                    except asyncio.CancelledError:
+                        pass
+                    except asyncio.InvalidStateError:
+                        pass
+                
+                if still_pending > 0:
+                    logger.warning(f"{still_pending} tasks did not complete within {timeout}s timeout")
+                    for task in pending:
+                        if not task.done():
+                            task.cancel()
+                else:
+                    logger.info(f"All {completed} tasks completed cancellation")
+                    
+            except Exception as e:
+                logger.error(f"Error during task cancellation: {e}")
         
         self._pending_tasks.clear()
-        logger.info("All pending tasks cancelled")
+        self._task_callbacks.clear()
+        self._task_results.clear()
+        self._completion_event.set()
+        logger.info("All pending tasks cancelled and cleaned up")
     
     def set_signal_session_manager(self, signal_session_manager: SignalSessionManager):
         """Set signal session manager for dependency injection"""
@@ -684,7 +860,6 @@ class PositionTracker:
                         )
                         
                         try:
-                            # Send text message with timeout protection (NO PHOTO for exit notification)
                             await asyncio.wait_for(
                                 self.telegram_app.bot.send_message(
                                     chat_id=user_id,
@@ -695,14 +870,12 @@ class PositionTracker:
                             )
                             logger.info(f"Exit notification sent to user {user_id} - TEXT ONLY (no photo)")
                             
-                            # Auto-delete exit chart if it was generated (tidak dikirim ke user)
                             if chart_path and self.config.CHART_AUTO_DELETE:
                                 await asyncio.sleep(1)
                                 self.chart_generator.delete_chart(chart_path)
                                 logger.info(f"Auto-deleted unused exit chart: {chart_path}")
                         except asyncio.TimeoutError:
                             logger.error(f"Failed to send exit notification to user {user_id}: asyncio.TimeoutError after 10s")
-                            # Fallback: send simple text without markdown
                             try:
                                 simple_msg = f"{result_emoji} {exit_label}\nType: {signal_type}\nEntry: ${entry_price:.2f}\nExit: ${exit_price:.2f}\nP/L: ${actual_pl:.2f}"
                                 await asyncio.wait_for(
@@ -713,9 +886,7 @@ class PositionTracker:
                             except Exception as fallback_error:
                                 logger.error(f"Fallback notification also failed: {fallback_error}")
                         except TimedOut as telegram_err:
-                            # Catch telegram.error.TimedOut explicitly
                             logger.error(f"Failed to send exit notification to user {user_id}: telegram.error.TimedOut")
-                            # Fallback: send simple text without markdown
                             try:
                                 simple_msg = f"{result_emoji} {exit_label}\nType: {signal_type}\nEntry: ${entry_price:.2f}\nExit: ${exit_price:.2f}\nP/L: ${actual_pl:.2f}"
                                 await asyncio.wait_for(
@@ -726,7 +897,6 @@ class PositionTracker:
                             except Exception as fallback_error:
                                 logger.error(f"Fallback notification also failed: {fallback_error}")
                         except Exception as telegram_err:
-                            # Catch other Telegram errors
                             logger.error(f"Failed to send exit notification to user {user_id}: {telegram_err}")
                     else:
                         logger.warning(f"Not enough candles for exit chart: {len(df_m1) if df_m1 else 0}")
@@ -844,7 +1014,8 @@ class PositionTracker:
     async def monitor_positions(self, market_data_client):
         """Monitor positions with tick data stream
         
-        Uses timeout on tick_queue.get() to allow graceful shutdown checking
+        Uses timeout on tick_queue.get() to allow graceful shutdown checking.
+        This task is tracked for proper lifecycle management.
         """
         tick_queue = await market_data_client.subscribe_ticks('position_tracker')
         logger.info("Position tracker monitoring started")
@@ -906,23 +1077,46 @@ class PositionTracker:
                 logger.error(f"Error unsubscribing from ticks: {e}")
             logger.info("Position tracker monitoring stopped")
     
+    def start_monitoring_task(self, market_data_client) -> asyncio.Task:
+        """Start the monitoring task and track it for lifecycle management.
+        
+        Returns:
+            asyncio.Task: The monitoring task
+        """
+        self._monitoring_task = self._create_tracked_task(
+            self.monitor_positions(market_data_client),
+            name="position_monitoring"
+        )
+        return self._monitoring_task
+    
     def stop_monitoring(self):
         """Stop the monitoring loop"""
         self.monitoring = False
         self._shutdown_event.set()
         logger.info("Position monitoring stop requested")
     
-    async def shutdown(self):
+    async def shutdown(self, timeout: float = TASK_CLEANUP_TIMEOUT):
         """Graceful shutdown with proper resource cleanup
         
-        Cancels all pending tasks and stops monitoring loop
+        Cancels all pending tasks and stops monitoring loop.
+        
+        Args:
+            timeout: Maximum time to wait for task cleanup
         """
         logger.info("PositionTracker shutdown initiated...")
         
         self.monitoring = False
         self._shutdown_event.set()
         
-        await self._cancel_pending_tasks()
+        if self._monitoring_task and not self._monitoring_task.done():
+            logger.info("Cancelling monitoring task...")
+            self._monitoring_task.cancel()
+            try:
+                await asyncio.wait_for(self._monitoring_task, timeout=5.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+        
+        await self._cancel_pending_tasks(timeout=timeout)
         
         async with self._position_lock:
             active_count = sum(len(positions) for positions in self.active_positions.values())
@@ -963,18 +1157,45 @@ class PositionTracker:
             return self.signal_session_manager.has_active_session(user_id)
         return user_id in self.active_positions and len(self.active_positions[user_id]) > 0
     
-    async def get_active_position_count_async(self, user_id: Optional[int] = None) -> int:
-        """Thread-safe getter for active position count (async version)"""
-        async with self._position_lock:
-            if user_id is not None:
-                return len(self.active_positions.get(user_id, {}))
-            return sum(len(positions) for positions in self.active_positions.values())
-    
-    def get_active_position_count(self, user_id: Optional[int] = None) -> int:
-        """Get active position count (sync version)
+    async def reload_active_positions(self):
+        """Reload active positions from the database
         
-        Note: For thread-safe access in async context, use get_active_position_count_async
+        This method is used to restore position tracking after a restart.
+        Thread-safe with lock protection.
         """
-        if user_id is not None:
-            return len(self.active_positions.get(user_id, {}))
-        return sum(len(positions) for positions in self.active_positions.values())
+        session = self.db.get_session()
+        try:
+            active_positions = session.query(Position).filter(Position.status == 'ACTIVE').all()
+            
+            async with self._position_lock:
+                self.active_positions.clear()
+                
+                for pos in active_positions:
+                    if pos.user_id not in self.active_positions:
+                        self.active_positions[pos.user_id] = {}
+                    
+                    self.active_positions[pos.user_id][pos.id] = {
+                        'trade_id': pos.trade_id,
+                        'signal_type': pos.signal_type,
+                        'entry_price': pos.entry_price,
+                        'stop_loss': pos.stop_loss,
+                        'take_profit': pos.take_profit,
+                        'original_sl': pos.original_sl or pos.stop_loss,
+                        'sl_adjustment_count': pos.sl_adjustment_count or 0,
+                        'max_profit_reached': pos.max_profit_reached or 0.0
+                    }
+            
+            total_positions = sum(len(positions) for positions in self.active_positions.values())
+            logger.info(f"Reloaded {total_positions} active positions from database")
+            
+        except Exception as e:
+            logger.error(f"Error reloading active positions: {e}", exc_info=True)
+            try:
+                session.rollback()
+            except Exception as rollback_error:
+                logger.error(f"Error during rollback: {rollback_error}")
+        finally:
+            try:
+                session.close()
+            except Exception as close_error:
+                logger.error(f"Error closing session: {close_error}")

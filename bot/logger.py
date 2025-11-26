@@ -1,12 +1,43 @@
+"""
+Logging module for the Trading Bot.
+
+Log Retention Policy:
+- Each log file is limited to 5MB (LOG_MAX_BYTES_DEFAULT)
+- Maximum 5 backup files per module (LOG_BACKUP_COUNT_DEFAULT)
+- Total maximum log storage per module: ~30MB (5MB * 6 files)
+- Stale log files (older than LOG_RETENTION_DAYS) are automatically cleaned
+- Log rotation is handled automatically by RotatingFileHandler
+- Manual cleanup can be triggered via cleanup_old_logs()
+
+Module-specific configurations can be set via LOG_CONFIG dictionary.
+"""
+
 import logging
 import os
 import re
 import time
+import glob
 import threading
 from collections import defaultdict
 from logging.handlers import RotatingFileHandler
-from datetime import datetime
-from typing import Dict, Optional
+from datetime import datetime, timedelta
+from typing import Dict, Optional, List, Any
+
+LOG_MAX_BYTES_DEFAULT = 5 * 1024 * 1024
+LOG_BACKUP_COUNT_DEFAULT = 5
+LOG_RETENTION_DAYS = 7
+
+LOG_CONFIG = {
+    'main': {'max_bytes': 10 * 1024 * 1024, 'backup_count': 5},
+    'strategy': {'max_bytes': 5 * 1024 * 1024, 'backup_count': 5},
+    'marketdata': {'max_bytes': 5 * 1024 * 1024, 'backup_count': 3},
+    'telegrambot': {'max_bytes': 5 * 1024 * 1024, 'backup_count': 5},
+    'errorhandler': {'max_bytes': 10 * 1024 * 1024, 'backup_count': 10},
+    'positiontracker': {'max_bytes': 5 * 1024 * 1024, 'backup_count': 5},
+    'riskmanager': {'max_bytes': 5 * 1024 * 1024, 'backup_count': 5},
+    'default': {'max_bytes': LOG_MAX_BYTES_DEFAULT, 'backup_count': LOG_BACKUP_COUNT_DEFAULT}
+}
+
 
 def mask_token(token: str) -> str:
     if not token or not isinstance(token, str):
@@ -18,6 +49,7 @@ def mask_token(token: str) -> str:
     
     return f"{token[:4]}...{token[-4:]}"
 
+
 def mask_user_id(user_id: int) -> str:
     if not user_id:
         return "***"
@@ -28,6 +60,7 @@ def mask_user_id(user_id: int) -> str:
     
     mid_len = len(user_id_str) - 6
     return f"{user_id_str[:3]}{'*' * min(mid_len, 3)}{user_id_str[-3:]}"
+
 
 def sanitize_log_message(message: str) -> str:
     if not message or not isinstance(message, str):
@@ -64,7 +97,213 @@ def sanitize_log_message(message: str) -> str:
     
     return sanitized
 
+
+def get_log_config(name: str) -> dict:
+    """
+    Get log configuration for a specific module.
+    
+    Args:
+        name: Logger/module name
+    
+    Returns:
+        dict with 'max_bytes' and 'backup_count'
+    """
+    name_lower = name.lower()
+    if name_lower in LOG_CONFIG:
+        return LOG_CONFIG[name_lower]
+    return LOG_CONFIG['default']
+
+
+def cleanup_old_logs(log_dir: str = 'logs', 
+                     retention_days: Optional[int] = None,
+                     dry_run: bool = False) -> Dict[str, Any]:
+    """
+    Clean up old and stale log files.
+    
+    This function removes:
+    1. Log files older than retention_days
+    2. Rotated backup files beyond the configured backup count
+    3. Empty log files
+    
+    Args:
+        log_dir: Directory containing log files
+        retention_days: Days to retain logs (default: LOG_RETENTION_DAYS)
+        dry_run: If True, only report what would be deleted without actually deleting
+    
+    Returns:
+        dict with cleanup statistics:
+            - 'deleted_count': Number of files deleted
+            - 'deleted_files': List of deleted file paths
+            - 'freed_bytes': Total bytes freed
+            - 'errors': List of any errors encountered
+    """
+    if retention_days is None:
+        retention_days = LOG_RETENTION_DAYS
+    
+    result = {
+        'deleted_count': 0,
+        'deleted_files': [],
+        'freed_bytes': 0,
+        'errors': [],
+        'dry_run': dry_run
+    }
+    
+    if not os.path.exists(log_dir):
+        return result
+    
+    cutoff_time = datetime.now() - timedelta(days=retention_days)
+    cutoff_timestamp = cutoff_time.timestamp()
+    
+    log_patterns = [
+        os.path.join(log_dir, '*.log'),
+        os.path.join(log_dir, '*.log.*')
+    ]
+    
+    log_files = []
+    for pattern in log_patterns:
+        log_files.extend(glob.glob(pattern))
+    
+    for log_file in log_files:
+        try:
+            file_stat = os.stat(log_file)
+            file_mtime = file_stat.st_mtime
+            file_size = file_stat.st_size
+            
+            should_delete = False
+            reason = ""
+            
+            if file_mtime < cutoff_timestamp:
+                should_delete = True
+                reason = f"older than {retention_days} days"
+            
+            if file_size == 0:
+                should_delete = True
+                reason = "empty file"
+            
+            base_name = os.path.basename(log_file)
+            if '.log.' in base_name:
+                parts = base_name.split('.log.')
+                if len(parts) == 2:
+                    try:
+                        backup_num = int(parts[1])
+                        module_name = parts[0].lower()
+                        config = get_log_config(module_name)
+                        if backup_num > config['backup_count']:
+                            should_delete = True
+                            reason = f"exceeds backup count ({backup_num} > {config['backup_count']})"
+                    except ValueError:
+                        pass
+            
+            if should_delete:
+                if dry_run:
+                    result['deleted_files'].append(f"{log_file} ({reason})")
+                    result['freed_bytes'] += file_size
+                    result['deleted_count'] += 1
+                else:
+                    os.remove(log_file)
+                    result['deleted_files'].append(log_file)
+                    result['freed_bytes'] += file_size
+                    result['deleted_count'] += 1
+        
+        except OSError as e:
+            result['errors'].append(f"Error processing {log_file}: {str(e)}")
+        except Exception as e:
+            result['errors'].append(f"Unexpected error for {log_file}: {str(e)}")
+    
+    return result
+
+
+def get_log_statistics(log_dir: str = 'logs') -> Dict[str, Any]:
+    """
+    Get statistics about current log files.
+    
+    Args:
+        log_dir: Directory containing log files
+    
+    Returns:
+        dict with log statistics:
+            - 'total_files': Total number of log files
+            - 'total_size_bytes': Total size of all log files
+            - 'total_size_mb': Total size in megabytes
+            - 'files_by_module': Dict of module -> list of file info
+            - 'oldest_file': Oldest log file info
+            - 'newest_file': Newest log file info
+    """
+    result = {
+        'total_files': 0,
+        'total_size_bytes': 0,
+        'total_size_mb': 0.0,
+        'files_by_module': defaultdict(list),
+        'oldest_file': None,
+        'newest_file': None
+    }
+    
+    if not os.path.exists(log_dir):
+        return result
+    
+    log_patterns = [
+        os.path.join(log_dir, '*.log'),
+        os.path.join(log_dir, '*.log.*')
+    ]
+    
+    log_files = []
+    for pattern in log_patterns:
+        log_files.extend(glob.glob(pattern))
+    
+    oldest_mtime = float('inf')
+    newest_mtime = 0
+    
+    for log_file in log_files:
+        try:
+            file_stat = os.stat(log_file)
+            file_info = {
+                'path': log_file,
+                'name': os.path.basename(log_file),
+                'size_bytes': file_stat.st_size,
+                'size_mb': round(file_stat.st_size / (1024 * 1024), 2),
+                'modified': datetime.fromtimestamp(file_stat.st_mtime).isoformat()
+            }
+            
+            result['total_files'] += 1
+            result['total_size_bytes'] += file_stat.st_size
+            
+            base_name = os.path.basename(log_file).split('.log')[0]
+            result['files_by_module'][base_name].append(file_info)
+            
+            if file_stat.st_mtime < oldest_mtime:
+                oldest_mtime = file_stat.st_mtime
+                result['oldest_file'] = file_info
+            
+            if file_stat.st_mtime > newest_mtime:
+                newest_mtime = file_stat.st_mtime
+                result['newest_file'] = file_info
+        
+        except (OSError, Exception):
+            pass
+    
+    result['total_size_mb'] = round(result['total_size_bytes'] / (1024 * 1024), 2)
+    result['files_by_module'] = dict(result['files_by_module'])
+    
+    return result
+
+
 def setup_logger(name='TradingBot', log_dir='logs', level=None):
+    """
+    Setup a logger with file rotation and console output.
+    
+    Log Rotation Configuration:
+    - File rotation is handled automatically by RotatingFileHandler
+    - Each module can have custom max_bytes and backup_count via LOG_CONFIG
+    - Default: 5MB per file, 5 backup files
+    
+    Args:
+        name: Logger name (used for file naming and module-specific config)
+        log_dir: Directory for log files
+        level: Log level (default: from LOG_LEVEL env var or INFO)
+    
+    Returns:
+        logging.Logger instance
+    """
     os.makedirs(log_dir, exist_ok=True)
     
     if level is None:
@@ -89,10 +328,12 @@ def setup_logger(name='TradingBot', log_dir='logs', level=None):
         datefmt='%Y-%m-%d %H:%M:%S'
     )
     
+    config = get_log_config(name)
+    
     file_handler = RotatingFileHandler(
         os.path.join(log_dir, f'{name.lower()}.log'),
-        maxBytes=10 * 1024 * 1024,
-        backupCount=5,
+        maxBytes=config['max_bytes'],
+        backupCount=config['backup_count'],
         encoding='utf-8'
     )
     file_handler.setLevel(level)
@@ -239,3 +480,38 @@ def setup_rate_limited_logger(name: str = 'TradingBot',
     """
     base_logger = setup_logger(name, log_dir, level)
     return RateLimitedLogger(base_logger, max_similar_logs, window_seconds)
+
+
+def schedule_log_cleanup(log_dir: str = 'logs',
+                         interval_hours: int = 24,
+                         retention_days: int = None) -> threading.Thread:
+    """
+    Schedule periodic log cleanup in a background thread.
+    
+    Args:
+        log_dir: Directory containing log files
+        interval_hours: Hours between cleanup runs
+        retention_days: Days to retain logs
+    
+    Returns:
+        The cleanup thread (already started)
+    """
+    def cleanup_loop():
+        while True:
+            try:
+                result = cleanup_old_logs(log_dir, retention_days)
+                if result['deleted_count'] > 0:
+                    logger = logging.getLogger('LogCleanup')
+                    logger.info(
+                        f"Log cleanup: deleted {result['deleted_count']} files, "
+                        f"freed {result['freed_bytes'] / 1024 / 1024:.2f}MB"
+                    )
+            except Exception as e:
+                logger = logging.getLogger('LogCleanup')
+                logger.error(f"Log cleanup error: {e}")
+            
+            time.sleep(interval_hours * 3600)
+    
+    cleanup_thread = threading.Thread(target=cleanup_loop, daemon=True, name='LogCleanupThread')
+    cleanup_thread.start()
+    return cleanup_thread

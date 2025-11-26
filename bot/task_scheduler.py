@@ -1,7 +1,7 @@
 import asyncio
 import gc
 from datetime import datetime, time, timedelta
-from typing import Callable, Optional, Dict, List, Set
+from typing import Callable, Optional, Dict, List, Set, Any
 import pytz
 from bot.logger import setup_logger
 
@@ -10,8 +10,17 @@ logger = setup_logger('TaskScheduler')
 TASK_EXECUTION_TIMEOUT = 60
 TASK_CANCEL_TIMEOUT = 5
 SCHEDULER_STOP_TIMEOUT = 10
+FLUSH_PENDING_TIMEOUT = 15
 
 class ScheduledTask:
+    """Represents a scheduled task with execution tracking and error handling.
+    
+    Task Lifecycle:
+    - Tasks are created with interval or schedule_time
+    - should_run() determines if task is ready to execute
+    - execute() runs the task with timeout protection
+    - Done callbacks drain exceptions and log completion
+    """
     def __init__(self, name: str, func: Callable, interval: Optional[int] = None,
                  schedule_time: Optional[time] = None, timezone: str = 'Asia/Jakarta'):
         self.name = name
@@ -27,6 +36,7 @@ class ScheduledTask:
         self.consecutive_failures = 0
         self.current_execution_task = None
         self._is_executing = False
+        self._last_exception: Optional[Exception] = None
         
         self._calculate_next_run()
     
@@ -65,12 +75,21 @@ class ScheduledTask:
         now = datetime.now(self.timezone)
         return now >= self.next_run
     
-    async def execute(self, alert_system=None, shutdown_flag: Optional[asyncio.Event] = None):
+    async def execute(self, alert_system=None, shutdown_flag: Optional[asyncio.Event] = None,
+                      on_complete: Optional[Callable[[asyncio.Task, str], None]] = None):
+        """Execute the scheduled task with proper lifecycle management.
+        
+        Args:
+            alert_system: Optional alert system for error notifications
+            shutdown_flag: Event that signals shutdown request
+            on_complete: Optional callback invoked when task completes (receives task and task name)
+        """
         if self._is_executing:
             logger.warning(f"Task {self.name} is already executing, skipping")
             return
         
         self._is_executing = True
+        self._last_exception = None
         try:
             logger.info(f"Executing scheduled task: {self.name}")
             
@@ -80,6 +99,16 @@ class ScheduledTask:
             
             if asyncio.iscoroutinefunction(self.func):
                 self.current_execution_task = asyncio.create_task(self.func())
+                self.current_execution_task.set_name(f"exec_{self.name}")
+                
+                if on_complete:
+                    def _done_callback(t: asyncio.Task):
+                        try:
+                            on_complete(t, self.name)
+                        except Exception as cb_err:
+                            logger.error(f"Completion callback error for {self.name}: {cb_err}")
+                    self.current_execution_task.add_done_callback(_done_callback)
+                
                 try:
                     await asyncio.wait_for(self.current_execution_task, timeout=TASK_EXECUTION_TIMEOUT)
                 except asyncio.TimeoutError:
@@ -107,11 +136,13 @@ class ScheduledTask:
         except asyncio.TimeoutError:
             self.error_count += 1
             self.consecutive_failures += 1
+            self._last_exception = asyncio.TimeoutError(f"Task {self.name} timed out")
             self._calculate_next_run()
             logger.error(f"Task {self.name} timed out (Consecutive failures: {self.consecutive_failures})")
         except Exception as e:
             self.error_count += 1
             self.consecutive_failures += 1
+            self._last_exception = e
             self._calculate_next_run()
             logger.error(f"Error executing task {self.name}: {e} (Consecutive failures: {self.consecutive_failures})")
             
@@ -134,6 +165,10 @@ class ScheduledTask:
         finally:
             self.current_execution_task = None
             self._is_executing = False
+    
+    def get_last_exception(self) -> Optional[Exception]:
+        """Get the last exception raised by this task."""
+        return self._last_exception
     
     async def cancel_execution(self, timeout: float = TASK_CANCEL_TIMEOUT) -> bool:
         if self.current_execution_task and not self.current_execution_task.done():
@@ -170,10 +205,19 @@ class ScheduledTask:
             'next_run': self.next_run.isoformat() if self.next_run else None,
             'run_count': self.run_count,
             'error_count': self.error_count,
-            'is_executing': self._is_executing
+            'is_executing': self._is_executing,
+            'last_exception': str(self._last_exception) if self._last_exception else None
         }
 
 class TaskScheduler:
+    """Task scheduler with background task callbacks and graceful shutdown.
+    
+    Background Task Callbacks:
+    - All scheduled task futures are tracked in _active_task_executions
+    - Completion callbacks drain exceptions and log task completion
+    - flush_pending_tasks() allows waiting for all tasks with timeout
+    - Graceful cancellation with bounded wait timeout
+    """
     def __init__(self, config, alert_system=None):
         self.config = config
         self.alert_system = alert_system
@@ -184,7 +228,32 @@ class TaskScheduler:
         self._active_task_executions: Set[asyncio.Task] = set()
         self._all_created_tasks: Set[asyncio.Task] = set()
         self._lock = asyncio.Lock()
+        self._task_exceptions: Dict[str, Exception] = {}
+        self._completion_event = asyncio.Event()
         logger.info("Task scheduler initialized with alert system")
+    
+    def _on_task_done(self, task: asyncio.Task, task_name: str) -> None:
+        """Callback invoked when a tracked task completes.
+        
+        Handles exception draining and logging for background tasks.
+        """
+        try:
+            if task.cancelled():
+                logger.debug(f"Scheduled task {task_name} was cancelled")
+                return
+            
+            try:
+                exception = task.exception()
+                if exception:
+                    self._task_exceptions[task_name] = exception
+                    logger.error(f"Scheduled task {task_name} raised exception: {exception}", exc_info=exception)
+            except asyncio.InvalidStateError:
+                pass
+            except asyncio.CancelledError:
+                pass
+                
+        except Exception as e:
+            logger.error(f"Error in task done callback for {task_name}: {e}")
     
     def add_task(self, name: str, func: Callable, interval: Optional[int] = None,
                 schedule_time: Optional[time] = None, timezone: str = 'Asia/Jakarta'):
@@ -233,21 +302,64 @@ class TaskScheduler:
     def get_all_tasks(self) -> List[ScheduledTask]:
         return list(self.tasks.values())
     
+    def get_pending_exceptions(self) -> Dict[str, Exception]:
+        """Get all exceptions from completed tasks.
+        
+        Returns:
+            Dict mapping task names to their exceptions
+        """
+        return self._task_exceptions.copy()
+    
+    def clear_exceptions(self) -> None:
+        """Clear all stored exceptions."""
+        self._task_exceptions.clear()
+    
     async def _track_task(self, task: asyncio.Task, task_name: str):
+        """Track a task and handle its completion with exception draining."""
         async with self._lock:
             self._active_task_executions.add(task)
             self._all_created_tasks.add(task)
+            self._completion_event.clear()
         
         try:
             await task
         except asyncio.CancelledError:
             logger.debug(f"Tracked task {task_name} was cancelled")
         except Exception as e:
+            self._task_exceptions[task_name] = e
             logger.error(f"Tracked task {task_name} failed: {e}")
         finally:
             async with self._lock:
                 self._active_task_executions.discard(task)
                 self._all_created_tasks.discard(task)
+                if len(self._active_task_executions) == 0:
+                    self._completion_event.set()
+    
+    async def flush_pending_tasks(self, timeout: float = FLUSH_PENDING_TIMEOUT) -> bool:
+        """Wait for all pending task executions to complete.
+        
+        Args:
+            timeout: Maximum time to wait in seconds
+            
+        Returns:
+            bool: True if all tasks completed, False if timeout occurred
+        """
+        async with self._lock:
+            if not self._active_task_executions:
+                return True
+            pending_count = len(self._active_task_executions)
+        
+        logger.info(f"Flushing {pending_count} pending task executions (timeout={timeout}s)...")
+        
+        try:
+            await asyncio.wait_for(self._completion_event.wait(), timeout=timeout)
+            logger.info("All pending task executions completed")
+            return True
+        except asyncio.TimeoutError:
+            async with self._lock:
+                remaining = len(self._active_task_executions)
+            logger.warning(f"Flush timeout: {remaining} tasks still pending after {timeout}s")
+            return False
     
     async def _scheduler_loop(self):
         logger.info("Scheduler loop started")
@@ -265,15 +377,25 @@ class TaskScheduler:
                             break
                         
                         if task.should_run():
+                            def make_done_callback(task_name: str):
+                                def callback(t: asyncio.Task):
+                                    self._on_task_done(t, task_name)
+                                return callback
+                            
                             execution_task = asyncio.create_task(
                                 task.execute(
                                     alert_system=self.alert_system,
-                                    shutdown_flag=self._shutdown_flag
+                                    shutdown_flag=self._shutdown_flag,
+                                    on_complete=lambda t, n: None
                                 )
                             )
                             execution_task.set_name(f"task_exec_{task.name}")
+                            execution_task.add_done_callback(make_done_callback(task.name))
                             
-                            asyncio.create_task(self._track_task(execution_task, task.name))
+                            tracking_task = asyncio.create_task(
+                                self._track_task(execution_task, task.name)
+                            )
+                            tracking_task.set_name(f"track_{task.name}")
                     
                     try:
                         await asyncio.wait_for(
@@ -304,12 +426,18 @@ class TaskScheduler:
             return
         
         self._shutdown_flag.clear()
+        self._completion_event.clear()
         self.running = True
         self.scheduler_task = asyncio.create_task(self._scheduler_loop())
         self.scheduler_task.set_name("scheduler_loop")
         logger.info("Task scheduler started")
     
-    async def stop(self):
+    async def stop(self, graceful_timeout: float = SCHEDULER_STOP_TIMEOUT):
+        """Stop the scheduler with graceful shutdown.
+        
+        Args:
+            graceful_timeout: Maximum time to wait for graceful shutdown
+        """
         logger.info("=" * 50)
         logger.info("STOPPING TASK SCHEDULER")
         logger.info(f"Active task executions: {len(self._active_task_executions)}")
@@ -365,7 +493,7 @@ class TaskScheduler:
                 try:
                     done, pending = await asyncio.wait(
                         active_tasks,
-                        timeout=SCHEDULER_STOP_TIMEOUT,
+                        timeout=graceful_timeout,
                         return_when=asyncio.ALL_COMPLETED
                     )
                     
@@ -394,6 +522,14 @@ class TaskScheduler:
             
             self._active_task_executions.clear()
         
+        self._completion_event.set()
+        
+        exceptions_count = len(self._task_exceptions)
+        if exceptions_count > 0:
+            logger.warning(f"{exceptions_count} tasks had exceptions during this session")
+            for task_name, exc in self._task_exceptions.items():
+                logger.debug(f"  - {task_name}: {exc}")
+        
         logger.info("=" * 50)
         logger.info("TASK SCHEDULER STOPPED SUCCESSFULLY")
         logger.info(f"Final state - Running: {self.running}, Shutdown flag: {self._shutdown_flag.is_set()}")
@@ -408,6 +544,7 @@ class TaskScheduler:
             'executing_tasks': len([t for t in self.tasks.values() if t._is_executing]),
             'active_executions': len(self._active_task_executions),
             'total_tracked_tasks': len(self._all_created_tasks),
+            'pending_exceptions': len(self._task_exceptions),
             'tasks': {name: task.to_dict() for name, task in self.tasks.items()}
         }
     
@@ -469,9 +606,15 @@ def setup_default_tasks(scheduler: TaskScheduler, bot_components: Dict):
                 logger.info(f"Deleted {old_trades} old trade records")
             except Exception as e:
                 logger.error(f"Error cleaning database: {e}")
-                session.rollback()
+                try:
+                    session.rollback()
+                except Exception as rollback_error:
+                    logger.error(f"Error during rollback: {rollback_error}")
             finally:
-                session.close()
+                try:
+                    session.close()
+                except Exception as close_error:
+                    logger.error(f"Error closing session: {close_error}")
     
     async def health_check():
         logger.info("Running health check...")
@@ -570,7 +713,7 @@ def setup_default_tasks(scheduler: TaskScheduler, bot_components: Dict):
     scheduler.add_daily_task(
         'database_cleanup',
         cleanup_database,
-        hour=2,
+        hour=3,
         minute=0
     )
     
@@ -581,13 +724,13 @@ def setup_default_tasks(scheduler: TaskScheduler, bot_components: Dict):
     )
     
     scheduler.add_interval_task(
-        'monitor_positions',
+        'position_monitoring',
         monitor_positions,
         interval_seconds=10
     )
     
     scheduler.add_interval_task(
-        'garbage_collection',
+        'periodic_gc',
         periodic_gc,
         interval_seconds=300
     )
@@ -595,7 +738,7 @@ def setup_default_tasks(scheduler: TaskScheduler, bot_components: Dict):
     scheduler.add_interval_task(
         'save_candles',
         save_candles_periodic,
-        interval_seconds=300
+        interval_seconds=60
     )
     
-    logger.info("Default tasks setup completed")
+    logger.info(f"Configured {len(scheduler.tasks)} default scheduled tasks")

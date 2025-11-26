@@ -1,7 +1,8 @@
-from typing import Optional, Dict, Tuple, Any, List
+from typing import Optional, Dict, Tuple, Any, List, NamedTuple
 import json
 from bot.logger import setup_logger
 import math
+from dataclasses import dataclass, field
 
 logger = setup_logger('Strategy')
 
@@ -12,6 +13,191 @@ class StrategyError(Exception):
 class IndicatorValidationError(StrategyError):
     """Indicator data validation error"""
     pass
+
+class PriceValidationError(StrategyError):
+    """Price data validation error for NaN/Inf/negative values"""
+    pass
+
+
+@dataclass
+class ValidationResult:
+    """Result of price/indicator validation with warnings"""
+    is_valid: bool
+    value: float
+    warnings: List[str] = field(default_factory=list)
+    error: Optional[str] = None
+    
+    def add_warning(self, msg: str):
+        self.warnings.append(msg)
+        logger.warning(f"Validation warning: {msg}")
+
+
+class PriceDataValidator:
+    """Centralized price data validation pipeline for NaN/Inf/Negative handling"""
+    
+    def __init__(self):
+        self._validation_warnings: List[str] = []
+        self._rejected_count = 0
+    
+    def reset_warnings(self):
+        """Reset validation warnings for new validation cycle"""
+        self._validation_warnings = []
+    
+    def get_warnings(self) -> List[str]:
+        """Get accumulated validation warnings"""
+        return self._validation_warnings.copy()
+    
+    def get_rejected_count(self) -> int:
+        """Get count of rejected values"""
+        return self._rejected_count
+    
+    def _add_warning(self, msg: str):
+        """Add a validation warning and log it"""
+        self._validation_warnings.append(msg)
+        logger.warning(f"Price validation: {msg}")
+    
+    def validate(self, value: Any, name: str = "", 
+                 min_val: Optional[float] = None, 
+                 max_val: Optional[float] = None,
+                 allow_zero: bool = False,
+                 allow_negative: bool = False) -> ValidationResult:
+        """Validate a single price/numeric value
+        
+        Args:
+            value: Value to validate
+            name: Name for logging/warnings
+            min_val: Minimum allowed value
+            max_val: Maximum allowed value
+            allow_zero: Whether zero is allowed
+            allow_negative: Whether negative values are allowed
+            
+        Returns:
+            ValidationResult with is_valid, cleaned value, and any warnings
+        """
+        result = ValidationResult(is_valid=True, value=0.0)
+        
+        if value is None:
+            result.is_valid = False
+            result.error = f"{name or 'Value'} is None"
+            self._add_warning(result.error)
+            self._rejected_count += 1
+            return result
+        
+        if not isinstance(value, (int, float)):
+            try:
+                value = float(value)
+            except (TypeError, ValueError) as e:
+                result.is_valid = False
+                result.error = f"{name or 'Value'} is not a number: {type(value).__name__}"
+                self._add_warning(result.error)
+                self._rejected_count += 1
+                return result
+        
+        try:
+            if math.isnan(value):
+                result.is_valid = False
+                result.error = f"{name or 'Value'} is NaN"
+                self._add_warning(result.error)
+                self._rejected_count += 1
+                return result
+            
+            if math.isinf(value):
+                result.is_valid = False
+                result.error = f"{name or 'Value'} is Inf (sign={'+' if value > 0 else '-'})"
+                self._add_warning(result.error)
+                self._rejected_count += 1
+                return result
+        except TypeError:
+            result.is_valid = False
+            result.error = f"{name or 'Value'} type error in NaN/Inf check"
+            self._add_warning(result.error)
+            self._rejected_count += 1
+            return result
+        
+        if not allow_negative and value < 0:
+            result.is_valid = False
+            result.error = f"{name or 'Value'} is negative: {value}"
+            self._add_warning(result.error)
+            self._rejected_count += 1
+            return result
+        
+        if not allow_zero and value == 0:
+            result.is_valid = False
+            result.error = f"{name or 'Value'} is zero (not allowed)"
+            self._add_warning(result.error)
+            self._rejected_count += 1
+            return result
+        
+        if min_val is not None and value < min_val:
+            result.add_warning(f"{name or 'Value'} ({value}) below minimum ({min_val})")
+            result.value = min_val
+            return result
+        
+        if max_val is not None and value > max_val:
+            result.add_warning(f"{name or 'Value'} ({value}) above maximum ({max_val})")
+            result.value = max_val
+            return result
+        
+        result.value = float(value)
+        return result
+    
+    def validate_price(self, price: Any, name: str = "price") -> ValidationResult:
+        """Validate a price value (must be positive, no NaN/Inf)"""
+        return self.validate(price, name, min_val=0.01, allow_zero=False, allow_negative=False)
+    
+    def validate_ratio(self, ratio: Any, name: str = "ratio", 
+                       min_val: float = 0.0, max_val: float = 100.0) -> ValidationResult:
+        """Validate a ratio/percentage value"""
+        return self.validate(ratio, name, min_val=min_val, max_val=max_val, allow_zero=True)
+    
+    def validate_atr(self, atr: Any, name: str = "atr") -> ValidationResult:
+        """Validate ATR value (must be positive)"""
+        return self.validate(atr, name, min_val=0.0001, allow_zero=False, allow_negative=False)
+
+
+_price_validator = PriceDataValidator()
+
+
+def validate_price_data(prices: Dict[str, Any], 
+                        required_fields: Optional[List[str]] = None) -> Tuple[bool, Dict[str, float], List[str]]:
+    """Centralized price data validation with NaN/Inf/Negative rejection
+    
+    Args:
+        prices: Dictionary of price field names to values
+        required_fields: List of required field names (all must pass validation)
+        
+    Returns:
+        Tuple of (all_valid, cleaned_prices, warnings)
+        - all_valid: True if all required fields are valid
+        - cleaned_prices: Dictionary with validated float values
+        - warnings: List of validation warning messages
+    """
+    _price_validator.reset_warnings()
+    cleaned = {}
+    all_valid = True
+    
+    if required_fields is None:
+        required_fields = list(prices.keys())
+    
+    for field_name, value in prices.items():
+        is_required = field_name in required_fields
+        
+        if 'price' in field_name.lower() or field_name in ['close', 'open', 'high', 'low']:
+            result = _price_validator.validate_price(value, field_name)
+        elif 'atr' in field_name.lower():
+            result = _price_validator.validate_atr(value, field_name)
+        elif 'rsi' in field_name.lower() or 'stoch' in field_name.lower():
+            result = _price_validator.validate_ratio(value, field_name, 0, 100)
+        else:
+            result = _price_validator.validate(value, field_name, allow_negative=True, allow_zero=True)
+        
+        if result.is_valid:
+            cleaned[field_name] = result.value
+        elif is_required:
+            all_valid = False
+            logger.error(f"Required price field validation failed: {result.error}")
+    
+    return all_valid, cleaned, _price_validator.get_warnings()
 
 
 def is_valid_number(value: Any) -> bool:

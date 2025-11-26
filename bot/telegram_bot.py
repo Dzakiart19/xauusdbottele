@@ -228,10 +228,26 @@ class TradingBot:
         self.signal_price_tolerance_pips = 10.0
         self._cache_lock = asyncio.Lock()
         self._dashboard_lock = asyncio.Lock()
+        self._chart_cleanup_lock = asyncio.Lock()
         self._cache_cleanup_task: Optional[asyncio.Task] = None
         self._dashboard_cleanup_task: Optional[asyncio.Task] = None
+        self._chart_cleanup_task: Optional[asyncio.Task] = None
         self._cleanup_tasks_running: bool = False
-        logger.info("✅ Two-phase anti-duplicate signal cache initialized (pending→confirmed)")
+        
+        self._cache_telemetry = {
+            'hits': 0,
+            'misses': 0,
+            'pending_set': 0,
+            'confirmed': 0,
+            'rollbacks': 0,
+            'expired_cleanups': 0,
+            'size_enforcements': 0,
+            'last_cleanup_time': None,
+            'last_cleanup_count': 0,
+        }
+        self._pending_charts: Dict[int, Dict[str, any]] = {}
+        self._chart_eviction_callbacks: List[Callable] = []
+        logger.info("✅ Two-phase anti-duplicate signal cache initialized (pending→confirmed) with telemetry")
         
         import os
         self.instance_lock_file = os.path.join('data', '.bot_instance.lock')
@@ -256,7 +272,11 @@ class TradingBot:
         return f"{user_id}_{signal_type}_{price_bucket}"
     
     async def _check_and_set_pending(self, user_id: int, signal_type: str, entry_price: float) -> bool:
-        """Check for duplicate and set pending status atomically. Returns True if signal can proceed."""
+        """Check for duplicate and set pending status atomically. Returns True if signal can proceed.
+        
+        Uses TTL-backed cache with time decay for automatic expiry.
+        Tracks telemetry for cache hits/misses.
+        """
         async with self._cache_lock:
             now = datetime.now()
             cache_copy = dict(self.sent_signals_cache)
@@ -265,8 +285,10 @@ class TradingBot:
                 k for k, v in cache_copy.items() 
                 if (now - v['timestamp']).total_seconds() > self.signal_cache_expiry_seconds
             ]
-            for k in expired_keys:
-                self.sent_signals_cache.pop(k, None)
+            if expired_keys:
+                for k in expired_keys:
+                    self.sent_signals_cache.pop(k, None)
+                self._cache_telemetry['expired_cleanups'] += len(expired_keys)
             
             if len(self.sent_signals_cache) >= self.MAX_CACHE_SIZE:
                 sorted_entries = sorted(
@@ -277,6 +299,7 @@ class TradingBot:
                 for i in range(min(entries_to_remove, len(sorted_entries))):
                     key_to_remove = sorted_entries[i][0]
                     self.sent_signals_cache.pop(key_to_remove, None)
+                self._cache_telemetry['size_enforcements'] += 1
                 logger.debug(f"Cache limit enforcement: removed {entries_to_remove} oldest entries")
             
             signal_hash = self._generate_signal_hash(user_id, signal_type, entry_price)
@@ -285,31 +308,46 @@ class TradingBot:
             if cached:
                 status = cached.get('status', 'confirmed')
                 time_since = (now - cached['timestamp']).total_seconds()
-                logger.debug(f"Duplicate signal blocked: {signal_hash}, status={status}, {time_since:.1f}s ago")
+                self._cache_telemetry['hits'] += 1
+                logger.debug(f"Cache HIT - Duplicate signal blocked: {signal_hash}, status={status}, {time_since:.1f}s ago")
                 return False
             
+            self._cache_telemetry['misses'] += 1
+            self._cache_telemetry['pending_set'] += 1
             self.sent_signals_cache[signal_hash] = {
                 'status': 'pending',
-                'timestamp': now
+                'timestamp': now,
+                'user_id': user_id,
+                'signal_type': signal_type,
+                'entry_price': entry_price
             }
-            logger.debug(f"Signal marked as pending: {signal_hash}")
+            logger.debug(f"Cache MISS - Signal marked as pending: {signal_hash}")
             return True
     
     async def _confirm_signal_sent(self, user_id: int, signal_type: str, entry_price: float):
-        """Confirm signal was sent successfully - upgrade from pending to confirmed."""
+        """Confirm signal was sent successfully - upgrade from pending to confirmed.
+        
+        Layered cache transition: pending → confirmed
+        """
         async with self._cache_lock:
             signal_hash = self._generate_signal_hash(user_id, signal_type, entry_price)
             if signal_hash in self.sent_signals_cache:
                 self.sent_signals_cache[signal_hash]['status'] = 'confirmed'
                 self.sent_signals_cache[signal_hash]['timestamp'] = datetime.now()
-                logger.debug(f"Signal confirmed: {signal_hash}")
+                self.sent_signals_cache[signal_hash]['confirmed_at'] = datetime.now()
+                self._cache_telemetry['confirmed'] += 1
+                logger.debug(f"Signal confirmed (pending→confirmed): {signal_hash}")
     
     async def _rollback_signal_cache(self, user_id: int, signal_type: str, entry_price: float):
-        """Remove pending signal entry on failure."""
+        """Remove pending signal entry on failure.
+        
+        Cleans up pending entries when signal send fails.
+        """
         async with self._cache_lock:
             signal_hash = self._generate_signal_hash(user_id, signal_type, entry_price)
             removed = self.sent_signals_cache.pop(signal_hash, None)
             if removed:
+                self._cache_telemetry['rollbacks'] += 1
                 logger.debug(f"Signal cache rolled back: {signal_hash}")
     
     async def _clear_signal_cache(self, user_id: int = None):
@@ -326,7 +364,7 @@ class TradingBot:
                 logger.debug("Cleared all signal cache")
     
     async def start_background_cleanup_tasks(self):
-        """Mulai background tasks untuk cleanup cache dan dashboards"""
+        """Mulai background tasks untuk cleanup cache, dashboards, dan pending charts"""
         self._cleanup_tasks_running = True
         
         if self._cache_cleanup_task is None or self._cache_cleanup_task.done():
@@ -336,6 +374,10 @@ class TradingBot:
         if self._dashboard_cleanup_task is None or self._dashboard_cleanup_task.done():
             self._dashboard_cleanup_task = asyncio.create_task(self._dashboard_cleanup_loop())
             logger.info("✅ Dashboard cleanup background task started")
+        
+        if self._chart_cleanup_task is None or self._chart_cleanup_task.done():
+            self._chart_cleanup_task = asyncio.create_task(self._pending_chart_cleanup_loop())
+            logger.info("✅ Pending chart cleanup background task started")
     
     async def stop_background_cleanup_tasks(self):
         """Stop background cleanup tasks and all monitoring tasks"""
@@ -359,6 +401,17 @@ class TradingBot:
                 pass
             self._dashboard_cleanup_task = None
             logger.info("Dashboard cleanup task stopped")
+        
+        if self._chart_cleanup_task and not self._chart_cleanup_task.done():
+            self._chart_cleanup_task.cancel()
+            try:
+                await asyncio.wait_for(self._chart_cleanup_task, timeout=5.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+            self._chart_cleanup_task = None
+            logger.info("Pending chart cleanup task stopped")
+        
+        await self._cleanup_all_pending_charts()
         
         await self._cancel_all_monitoring_tasks()
         
@@ -450,16 +503,38 @@ class TradingBot:
             logger.info("Signal cache cleanup loop cancelled")
     
     async def _cleanup_expired_cache_entries(self) -> int:
-        """Cleanup expired entries dari signal cache"""
+        """Cleanup expired entries dari signal cache dengan time decay.
+        
+        Implements TTL-backed cache with time decay:
+        - Pending entries expire faster (60s) to prevent stuck entries
+        - Confirmed entries use full TTL (120s) for proper duplicate prevention
+        
+        Returns:
+            int: Number of entries cleaned up
+        """
         async with self._cache_lock:
             now = datetime.now()
-            expired_keys = [
-                k for k, v in self.sent_signals_cache.items() 
-                if (now - v['timestamp']).total_seconds() > self.signal_cache_expiry_seconds
-            ]
+            pending_ttl = 60
+            confirmed_ttl = self.signal_cache_expiry_seconds
+            
+            expired_keys = []
+            for k, v in self.sent_signals_cache.items():
+                age_seconds = (now - v['timestamp']).total_seconds()
+                status = v.get('status', 'confirmed')
+                
+                if status == 'pending' and age_seconds > pending_ttl:
+                    expired_keys.append(k)
+                    logger.debug(f"Time decay: pending entry {k} expired after {age_seconds:.1f}s")
+                elif status == 'confirmed' and age_seconds > confirmed_ttl:
+                    expired_keys.append(k)
             
             for k in expired_keys:
                 self.sent_signals_cache.pop(k, None)
+            
+            if expired_keys:
+                self._cache_telemetry['expired_cleanups'] += len(expired_keys)
+                self._cache_telemetry['last_cleanup_time'] = now
+                self._cache_telemetry['last_cleanup_count'] = len(expired_keys)
             
             return len(expired_keys)
     
@@ -524,21 +599,51 @@ class TradingBot:
         return cleaned
     
     def get_cache_stats(self) -> Dict:
-        """Dapatkan statistik cache untuk monitoring"""
+        """Dapatkan statistik cache untuk monitoring dengan telemetry data.
+        
+        Returns comprehensive cache statistics including:
+        - Cache size and usage
+        - Hit/miss ratios
+        - Pending vs confirmed entries breakdown
+        - Dashboard and monitoring stats
+        - Pending charts info
+        """
         try:
+            pending_count = sum(1 for v in self.sent_signals_cache.values() if v.get('status') == 'pending')
+            confirmed_count = sum(1 for v in self.sent_signals_cache.values() if v.get('status') == 'confirmed')
+            
+            total_lookups = self._cache_telemetry['hits'] + self._cache_telemetry['misses']
+            hit_rate = (self._cache_telemetry['hits'] / total_lookups * 100) if total_lookups > 0 else 0.0
+            
             return {
                 'signal_cache_size': len(self.sent_signals_cache),
                 'signal_cache_max': self.MAX_CACHE_SIZE,
                 'signal_cache_usage_pct': (len(self.sent_signals_cache) / self.MAX_CACHE_SIZE * 100) if self.MAX_CACHE_SIZE > 0 else 0,
+                'pending_entries': pending_count,
+                'confirmed_entries': confirmed_count,
                 'active_dashboards': len(self.active_dashboards),
                 'dashboards_max': self.MAX_DASHBOARDS,
                 'dashboards_usage_pct': (len(self.active_dashboards) / self.MAX_DASHBOARDS * 100) if self.MAX_DASHBOARDS > 0 else 0,
                 'monitoring_chats': len(self.monitoring_chats),
                 'monitoring_chats_max': self.MAX_MONITORING_CHATS,
                 'monitoring_tasks': len(self.monitoring_tasks),
+                'pending_charts': len(self._pending_charts),
                 'cache_expiry_seconds': self.signal_cache_expiry_seconds,
                 'is_shutting_down': self._is_shutting_down,
-                'cleanup_tasks_running': self._cleanup_tasks_running
+                'cleanup_tasks_running': self._cleanup_tasks_running,
+                'telemetry': {
+                    'cache_hits': self._cache_telemetry['hits'],
+                    'cache_misses': self._cache_telemetry['misses'],
+                    'hit_rate_pct': round(hit_rate, 2),
+                    'total_lookups': total_lookups,
+                    'pending_set': self._cache_telemetry['pending_set'],
+                    'confirmed': self._cache_telemetry['confirmed'],
+                    'rollbacks': self._cache_telemetry['rollbacks'],
+                    'expired_cleanups': self._cache_telemetry['expired_cleanups'],
+                    'size_enforcements': self._cache_telemetry['size_enforcements'],
+                    'last_cleanup_time': self._cache_telemetry['last_cleanup_time'].isoformat() if self._cache_telemetry['last_cleanup_time'] else None,
+                    'last_cleanup_count': self._cache_telemetry['last_cleanup_count'],
+                }
             }
         except AttributeError as e:
             logger.warning(f"Attribute error getting cache stats (bot may not be fully initialized): {e}")
@@ -546,6 +651,221 @@ class TradingBot:
         except Exception as e:
             logger.error(f"Unexpected error getting cache stats: {type(e).__name__}: {e}")
             return {'error': str(e)}
+    
+    def _get_cache_stats(self) -> Dict:
+        """Alias untuk get_cache_stats() untuk backward compatibility."""
+        return self.get_cache_stats()
+    
+    async def register_pending_chart(self, user_id: int, chart_path: str, signal_type: str = None):
+        """Register a pending chart for cleanup tracking.
+        
+        Args:
+            user_id: User ID associated with the chart
+            chart_path: Path to the chart file
+            signal_type: Type of signal (BUY/SELL)
+        """
+        async with self._chart_cleanup_lock:
+            self._pending_charts[user_id] = {
+                'chart_path': chart_path,
+                'signal_type': signal_type,
+                'created_at': datetime.now(),
+                'status': 'pending'
+            }
+            logger.debug(f"Registered pending chart for user {mask_user_id(user_id)}: {chart_path}")
+    
+    async def confirm_chart_sent(self, user_id: int):
+        """Confirm chart was sent successfully, update status.
+        
+        Args:
+            user_id: User ID whose chart was sent
+        """
+        async with self._chart_cleanup_lock:
+            if user_id in self._pending_charts:
+                self._pending_charts[user_id]['status'] = 'sent'
+                self._pending_charts[user_id]['sent_at'] = datetime.now()
+                logger.debug(f"Chart confirmed sent for user {mask_user_id(user_id)}")
+    
+    async def evict_pending_chart(self, user_id: int, reason: str = "manual"):
+        """Evict and cleanup a pending chart for a user.
+        
+        Args:
+            user_id: User ID whose chart should be evicted
+            reason: Reason for eviction
+            
+        Returns:
+            bool: True if chart was evicted, False otherwise
+        """
+        import os
+        
+        chart_info = None
+        async with self._chart_cleanup_lock:
+            chart_info = self._pending_charts.pop(user_id, None)
+        
+        if chart_info:
+            chart_path = chart_info.get('chart_path')
+            if chart_path and os.path.exists(chart_path):
+                try:
+                    os.remove(chart_path)
+                    logger.info(f"🗑️ Evicted pending chart for user {mask_user_id(user_id)}: {chart_path} (reason: {reason})")
+                    
+                    for callback in self._chart_eviction_callbacks:
+                        try:
+                            if asyncio.iscoroutinefunction(callback):
+                                await callback(user_id, chart_path, reason)
+                            else:
+                                callback(user_id, chart_path, reason)
+                        except Exception as e:
+                            logger.error(f"Error in chart eviction callback: {e}")
+                    
+                    return True
+                except FileNotFoundError:
+                    logger.debug(f"Chart already deleted: {chart_path}")
+                except Exception as e:
+                    logger.warning(f"Failed to evict chart {chart_path}: {e}")
+            return True
+        return False
+    
+    def register_chart_eviction_callback(self, callback: Callable):
+        """Register a callback to be called when a chart is evicted.
+        
+        Args:
+            callback: Callback function (can be async) with signature (user_id, chart_path, reason)
+        """
+        self._chart_eviction_callbacks.append(callback)
+        logger.debug(f"Registered chart eviction callback: {callback.__name__}")
+    
+    async def _pending_chart_cleanup_loop(self):
+        """Background task for cleaning up stale pending charts.
+        
+        Runs periodically to cleanup charts that were never sent or confirmed.
+        Uses time decay: charts older than TTL are automatically evicted.
+        """
+        cleanup_interval = 30
+        pending_chart_ttl_seconds = 120
+        
+        try:
+            while self._cleanup_tasks_running:
+                await asyncio.sleep(cleanup_interval)
+                
+                if not self._cleanup_tasks_running:
+                    break
+                
+                try:
+                    cleaned = await self._cleanup_stale_pending_charts(pending_chart_ttl_seconds)
+                    if cleaned > 0:
+                        logger.info(f"Pending chart cleanup: evicted {cleaned} stale charts")
+                except Exception as e:
+                    logger.error(f"Error in pending chart cleanup: {e}")
+                    
+        except asyncio.CancelledError:
+            logger.info("Pending chart cleanup loop cancelled")
+    
+    async def _cleanup_stale_pending_charts(self, max_age_seconds: int = 120) -> int:
+        """Cleanup stale pending charts with time decay.
+        
+        Args:
+            max_age_seconds: Maximum age in seconds before a chart is considered stale
+            
+        Returns:
+            int: Number of charts cleaned up
+        """
+        import os
+        
+        stale_users = []
+        charts_to_cleanup = []
+        
+        async with self._chart_cleanup_lock:
+            now = datetime.now()
+            
+            for user_id, chart_info in list(self._pending_charts.items()):
+                created_at = chart_info.get('created_at', now)
+                age_seconds = (now - created_at).total_seconds()
+                status = chart_info.get('status', 'pending')
+                
+                is_stale = False
+                if status == 'pending' and age_seconds > max_age_seconds:
+                    is_stale = True
+                    logger.debug(f"Stale pending chart for user {mask_user_id(user_id)}: {age_seconds:.1f}s old")
+                elif status == 'sent' and age_seconds > (max_age_seconds * 2):
+                    is_stale = True
+                
+                if is_stale:
+                    stale_users.append(user_id)
+                    charts_to_cleanup.append((user_id, chart_info.get('chart_path')))
+            
+            for user_id in stale_users:
+                self._pending_charts.pop(user_id, None)
+        
+        cleaned = 0
+        for user_id, chart_path in charts_to_cleanup:
+            if chart_path and os.path.exists(chart_path):
+                try:
+                    os.remove(chart_path)
+                    logger.info(f"🗑️ Cleaned stale pending chart: {chart_path}")
+                    cleaned += 1
+                except FileNotFoundError:
+                    pass
+                except Exception as e:
+                    logger.warning(f"Failed to cleanup stale chart {chart_path}: {e}")
+        
+        return cleaned
+    
+    async def _cleanup_all_pending_charts(self):
+        """Cleanup all pending charts - called during shutdown.
+        
+        Evicts all registered pending charts for a clean shutdown.
+        """
+        import os
+        
+        async with self._chart_cleanup_lock:
+            chart_count = len(self._pending_charts)
+            
+            if chart_count == 0:
+                logger.debug("No pending charts to cleanup")
+                return
+            
+            logger.info(f"Cleaning up {chart_count} pending charts during shutdown...")
+            
+            for user_id, chart_info in list(self._pending_charts.items()):
+                chart_path = chart_info.get('chart_path')
+                if chart_path and os.path.exists(chart_path):
+                    try:
+                        os.remove(chart_path)
+                        logger.debug(f"Cleaned up pending chart: {chart_path}")
+                    except Exception as e:
+                        logger.warning(f"Failed to cleanup chart {chart_path}: {e}")
+            
+            self._pending_charts.clear()
+            logger.info(f"✅ All {chart_count} pending charts cleaned up")
+    
+    async def _integrate_chart_with_session_manager(self):
+        """Integrate chart cleanup with SignalSessionManager.
+        
+        Registers event handlers for session events to cleanup charts
+        when sessions end.
+        """
+        if self.signal_session_manager:
+            async def on_session_end_chart_cleanup(session):
+                """Handler untuk cleanup chart saat session berakhir."""
+                try:
+                    user_id = session.user_id
+                    chart_path = session.chart_path
+                    
+                    if user_id in self._pending_charts:
+                        await self.evict_pending_chart(user_id, reason="session_end")
+                    elif chart_path:
+                        import os
+                        if os.path.exists(chart_path):
+                            try:
+                                os.remove(chart_path)
+                                logger.info(f"🗑️ Cleaned session chart on end: {chart_path}")
+                            except Exception as e:
+                                logger.warning(f"Failed to cleanup session chart: {e}")
+                except Exception as e:
+                    logger.error(f"Error in session end chart cleanup: {e}")
+            
+            self.signal_session_manager.register_event_handler('on_session_end', on_session_end_chart_cleanup)
+            logger.info("✅ Chart cleanup integrated with SignalSessionManager")
     
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
@@ -2039,6 +2359,16 @@ class TradingBot:
             else:
                 cleared_sessions = 0
             
+            logger.info("Cleaning up pending charts...")
+            pending_charts_count = len(self._pending_charts)
+            await self._cleanup_all_pending_charts()
+            logger.info(f"Cleaned up {pending_charts_count} pending charts")
+            
+            logger.info("Clearing signal cache...")
+            signal_cache_count = len(self.sent_signals_cache)
+            await self._clear_signal_cache()
+            logger.info(f"Cleared {signal_cache_count} signal cache entries")
+            
             logger.info("Clearing database records...")
             session = self.db.get_session()
             
@@ -2064,6 +2394,9 @@ class TradingBot:
                 f"• Task dibatalkan: {active_tasks}\n"
                 f"• Posisi aktif dihapus: {active_pos_count}\n"
                 f"• Sesi sinyal dibersihkan: {cleared_sessions}\n\n"
+                "*Cache & Charts:*\n"
+                f"• Pending charts dibersihkan: {pending_charts_count}\n"
+                f"• Signal cache dibersihkan: {signal_cache_count}\n\n"
                 "✨ *Sistem sekarang bersih dan siap digunakan lagi!*\n"
                 "Gunakan /monitor untuk mulai monitoring baru."
             )
@@ -2085,6 +2418,20 @@ class TradingBot:
         if self.signal_session_manager:
             self.signal_session_manager.register_event_handler('on_session_end', self._on_session_end_handler)
             logger.info("Registered dashboard cleanup handler for session end events")
+        
+        await self._integrate_chart_with_session_manager()
+        
+        if self.chart_generator:
+            def on_chart_eviction_notify(user_id: int, chart_path: str, reason: str):
+                """Notify chart generator when chart is evicted."""
+                try:
+                    if hasattr(self.chart_generator, '_pending_charts'):
+                        self.chart_generator._pending_charts.discard(chart_path)
+                except Exception as e:
+                    logger.debug(f"Chart generator notification skipped: {e}")
+            
+            self.register_chart_eviction_callback(on_chart_eviction_notify)
+            logger.info("Registered chart eviction callback for ChartGenerator integration")
         
         self.app.add_handler(CommandHandler("start", self.start_command))
         self.app.add_handler(CommandHandler("help", self.help_command))

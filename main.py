@@ -3,7 +3,10 @@ import signal
 import sys
 import os
 from aiohttp import web
-from typing import Optional
+from typing import Optional, Dict, Set, Any, Callable
+from dataclasses import dataclass, field
+from enum import Enum
+from datetime import datetime
 from sqlalchemy import text
 
 from config import Config
@@ -25,12 +28,48 @@ from bot.signal_session_manager import SignalSessionManager
 
 logger = setup_logger('Main')
 
+
+class TaskPriority(Enum):
+    CRITICAL = 1
+    HIGH = 2
+    NORMAL = 3
+    LOW = 4
+
+
+class TaskStatus(Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    CANCELLED = "cancelled"
+    FAILED = "failed"
+
+
+@dataclass
+class TaskInfo:
+    name: str
+    task: asyncio.Task
+    priority: TaskPriority = TaskPriority.NORMAL
+    critical: bool = False
+    created_at: datetime = field(default_factory=datetime.now)
+    status: TaskStatus = TaskStatus.RUNNING
+    cancel_timeout: float = 5.0
+    
+    def is_done(self) -> bool:
+        return self.task.done()
+    
+    def is_cancelled(self) -> bool:
+        return self.task.cancelled()
+
+
 class TradingBotOrchestrator:
+    SHUTDOWN_TOTAL_TIMEOUT = 30
+    SHUTDOWN_PHASE_TIMEOUT = 8
+    TASK_CANCEL_TIMEOUT = 5
+    
     def __init__(self):
         self.config = Config()
         self.config_valid = False
         
-        # Initialize Sentry for error tracking (optional - fallback to local logging if not configured)
         sentry_dsn = os.getenv('SENTRY_DSN')
         environment = os.getenv('ENVIRONMENT', 'production')
         initialize_sentry(sentry_dsn, environment)
@@ -47,15 +86,19 @@ class TradingBotOrchestrator:
             logger.warning("Set missing environment variables and restart to enable full functionality")
             self.config_valid = False
             
-            # Capture initialization errors to Sentry
             sentry = get_sentry_manager()
             sentry.capture_exception(e, {'context': 'Configuration validation'})
         
         self.running = False
-        self.shutdown_in_progress = False
+        self._shutdown_in_progress = False
+        self._shutdown_count = 0
+        self._shutdown_lock = asyncio.Lock()
         self.shutdown_event = asyncio.Event()
         self.health_server = None
-        self.tracked_tasks = []
+        
+        self._task_registry: Dict[str, TaskInfo] = {}
+        self._task_registry_lock = asyncio.Lock()
+        self._completed_tasks: Set[str] = set()
         
         self.db_manager = DatabaseManager(
             db_path=self.config.DATABASE_PATH,
@@ -63,7 +106,6 @@ class TradingBotOrchestrator:
         )
         logger.info("Database initialized")
         
-        # Initialize database backup manager
         self.backup_manager = DatabaseBackupManager(
             db_path=self.config.DATABASE_PATH,
             backup_dir='backups',
@@ -146,12 +188,153 @@ class TradingBotOrchestrator:
         
         logger.info("All components initialized successfully")
     
-    def _auto_detect_webhook_url(self) -> Optional[str]:
-        """Auto-detect webhook URL for Replit, Koyeb, and other cloud platforms
+    @property
+    def shutdown_in_progress(self) -> bool:
+        return self._shutdown_in_progress
+    
+    async def register_task(
+        self,
+        name: str,
+        task: asyncio.Task,
+        priority: TaskPriority = TaskPriority.NORMAL,
+        critical: bool = False,
+        cancel_timeout: float = 5.0
+    ) -> TaskInfo:
+        async with self._task_registry_lock:
+            if name in self._task_registry:
+                old_task = self._task_registry[name]
+                if not old_task.is_done():
+                    logger.warning(f"Replacing existing running task: {name}")
+                    old_task.task.cancel()
+            
+            task_info = TaskInfo(
+                name=name,
+                task=task,
+                priority=priority,
+                critical=critical,
+                cancel_timeout=cancel_timeout
+            )
+            self._task_registry[name] = task_info
+            logger.debug(f"Task registered: {name} (priority={priority.name}, critical={critical})")
+            return task_info
+    
+    async def unregister_task(self, name: str, cancel: bool = False) -> bool:
+        async with self._task_registry_lock:
+            if name not in self._task_registry:
+                logger.warning(f"Task not found for unregister: {name}")
+                return False
+            
+            task_info = self._task_registry[name]
+            
+            if cancel and not task_info.is_done():
+                task_info.task.cancel()
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(task_info.task),
+                        timeout=task_info.cancel_timeout
+                    )
+                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    pass
+            
+            task_info.status = TaskStatus.COMPLETED if task_info.is_done() else TaskStatus.CANCELLED
+            self._completed_tasks.add(name)
+            del self._task_registry[name]
+            logger.debug(f"Task unregistered: {name} (status={task_info.status.value})")
+            return True
+    
+    def get_task_status(self, name: str) -> Optional[TaskStatus]:
+        if name in self._task_registry:
+            task_info = self._task_registry[name]
+            if task_info.is_done():
+                if task_info.is_cancelled():
+                    return TaskStatus.CANCELLED
+                elif task_info.task.exception():
+                    return TaskStatus.FAILED
+                return TaskStatus.COMPLETED
+            return TaskStatus.RUNNING
+        elif name in self._completed_tasks:
+            return TaskStatus.COMPLETED
+        return None
+    
+    def get_registered_tasks(self) -> Dict[str, Dict[str, Any]]:
+        result = {}
+        for name, info in self._task_registry.items():
+            result[name] = {
+                'priority': info.priority.name,
+                'critical': info.critical,
+                'created_at': info.created_at.isoformat(),
+                'is_done': info.is_done(),
+                'is_cancelled': info.is_cancelled(),
+                'status': self.get_task_status(name).value if self.get_task_status(name) else 'unknown'
+            }
+        return result
+    
+    async def _cancel_task_with_shield(
+        self,
+        task_info: TaskInfo,
+        timeout: float
+    ) -> bool:
+        if task_info.is_done():
+            return True
         
-        Returns:
-            str: Auto-detected webhook URL or None if not detected
-        """
+        name = task_info.name
+        
+        if task_info.critical:
+            logger.info(f"[SHUTDOWN] Shielding critical task: {name}")
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(task_info.task),
+                    timeout=timeout
+                )
+                logger.info(f"[SHUTDOWN] Critical task completed: {name}")
+                return True
+            except asyncio.TimeoutError:
+                logger.warning(f"[SHUTDOWN] Critical task {name} timeout after {timeout}s, forcing cancel")
+                task_info.task.cancel()
+                try:
+                    await asyncio.wait_for(task_info.task, timeout=2.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    pass
+                return False
+            except asyncio.CancelledError:
+                logger.info(f"[SHUTDOWN] Critical task {name} cancelled")
+                return True
+        else:
+            logger.debug(f"[SHUTDOWN] Cancelling task: {name}")
+            task_info.task.cancel()
+            try:
+                await asyncio.wait_for(task_info.task, timeout=timeout)
+                return True
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                return False
+    
+    async def _cancel_all_registered_tasks(self, timeout: float = 10.0) -> int:
+        async with self._task_registry_lock:
+            if not self._task_registry:
+                return 0
+            
+            sorted_tasks = sorted(
+                self._task_registry.values(),
+                key=lambda t: (t.critical, t.priority.value),
+                reverse=True
+            )
+            
+            cancelled_count = 0
+            logger.info(f"[SHUTDOWN] Cancelling {len(sorted_tasks)} registered tasks...")
+            
+            for task_info in sorted_tasks:
+                if not task_info.is_done():
+                    per_task_timeout = min(timeout / len(sorted_tasks), task_info.cancel_timeout)
+                    success = await self._cancel_task_with_shield(task_info, per_task_timeout)
+                    if success:
+                        cancelled_count += 1
+                        task_info.status = TaskStatus.COMPLETED
+                    else:
+                        task_info.status = TaskStatus.CANCELLED
+            
+            return cancelled_count
+    
+    def _auto_detect_webhook_url(self) -> Optional[str]:
         if self.config.WEBHOOK_URL and self.config.WEBHOOK_URL.strip():
             return None
         
@@ -297,6 +480,8 @@ class TradingBotOrchestrator:
                 
                 overall_status = 'healthy' if self.config_valid and self.running and not is_degraded else 'degraded' if is_degraded else 'limited' if not self.config_valid else 'stopped'
                 
+                task_registry_info = self.get_registered_tasks()
+                
                 health_status = {
                     'status': overall_status,
                     'mode': mode,
@@ -311,6 +496,9 @@ class TradingBotOrchestrator:
                     'memory': memory_status,
                     'cache_stats': cache_stats,
                     'chart_stats': chart_stats,
+                    'registered_tasks': len(task_registry_info),
+                    'task_details': task_registry_info,
+                    'shutdown_in_progress': self._shutdown_in_progress,
                     'free_tier_mode': self.config.FREE_TIER_MODE,
                     'message': 'Bot running in degraded mode - memory critical' if is_degraded else 'Bot running in limited mode - set missing environment variables to enable full functionality' if not self.config_valid else 'Bot running normally'
                 }
@@ -463,7 +651,13 @@ class TradingBotOrchestrator:
             
             logger.info("Connecting to market data feed...")
             market_task = asyncio.create_task(self.market_data.connect_websocket())
-            self.tracked_tasks.append(market_task)
+            await self.register_task(
+                name="market_data_websocket",
+                task=market_task,
+                priority=TaskPriority.CRITICAL,
+                critical=True,
+                cancel_timeout=10.0
+            )
             
             logger.info("Waiting for initial market data (max 10s)...")
             for i in range(10):
@@ -487,7 +681,13 @@ class TradingBotOrchestrator:
             position_task = asyncio.create_task(
                 self.position_tracker.monitor_positions(self.market_data)
             )
-            self.tracked_tasks.append(position_task)
+            await self.register_task(
+                name="position_tracker",
+                task=position_task,
+                priority=TaskPriority.HIGH,
+                critical=False,
+                cancel_timeout=5.0
+            )
             
             logger.info("Initializing Telegram bot...")
             bot_initialized = await self.telegram_bot.initialize()
@@ -540,7 +740,13 @@ class TradingBotOrchestrator:
             
             logger.info("Starting Telegram bot polling...")
             bot_task = asyncio.create_task(self.telegram_bot.run())
-            self.tracked_tasks.append(bot_task)
+            await self.register_task(
+                name="telegram_bot",
+                task=bot_task,
+                priority=TaskPriority.HIGH,
+                critical=False,
+                cancel_timeout=8.0
+            )
             
             logger.info("Waiting for candles to build (minimal 30 candles, max 20s)...")
             candle_ready = False
@@ -613,6 +819,7 @@ class TradingBotOrchestrator:
             
             logger.info("=" * 60)
             logger.info("BOT IS NOW RUNNING")
+            logger.info(f"Registered tasks: {list(self._task_registry.keys())}")
             logger.info("=" * 60)
             logger.info("Press Ctrl+C to stop")
             
@@ -630,139 +837,172 @@ class TradingBotOrchestrator:
             await self.shutdown()
     
     async def shutdown(self):
-        if not self.running or self.shutdown_in_progress:
-            logger.debug("Shutdown already in progress or bot not running, skipping.")
+        async with self._shutdown_lock:
+            if self._shutdown_in_progress:
+                self._shutdown_count += 1
+                logger.warning(f"[SHUTDOWN] Shutdown already in progress (signal count: {self._shutdown_count})")
+                if self._shutdown_count >= 3:
+                    logger.error("[SHUTDOWN] Received 3+ shutdown signals, forcing immediate exit")
+                    sys.exit(1)
+                return
+            
+            self._shutdown_in_progress = True
+        
+        if not self.running and not self.health_server:
+            logger.debug("[SHUTDOWN] Bot not running and no health server, skipping shutdown")
+            self._shutdown_in_progress = False
             return
         
-        self.shutdown_in_progress = True
         logger.info("=" * 60)
-        logger.info("SHUTTING DOWN BOT...")
+        logger.info("[SHUTDOWN] GRACEFUL SHUTDOWN INITIATED")
         logger.info("=" * 60)
         
         self.running = False
-        shutdown_timeout = 28
-        
         loop = asyncio.get_running_loop()
         shutdown_start_time = loop.time()
         
+        def log_progress(phase: str, status: str = "started"):
+            elapsed = loop.time() - shutdown_start_time
+            logger.info(f"[SHUTDOWN] [{elapsed:.1f}s] Phase: {phase} - {status}")
+        
         try:
-            logger.info("Cancelling tracked async tasks...")
-            cancelled_count = 0
-            for task in self.tracked_tasks:
-                if not task.done():
-                    task.cancel()
-                    cancelled_count += 1
-            
-            if cancelled_count > 0:
-                logger.info(f"Cancelled {cancelled_count} tasks, waiting for completion...")
+            log_progress("MarketData", "saving candles and disconnecting")
+            if self.market_data:
                 try:
                     await asyncio.wait_for(
-                        asyncio.gather(*self.tracked_tasks, return_exceptions=True),
-                        timeout=8
+                        self.market_data.save_candles_to_db(self.db_manager),
+                        timeout=self.SHUTDOWN_PHASE_TIMEOUT
                     )
-                    logger.info("All tracked tasks completed")
+                    log_progress("MarketData", "candles saved")
                 except asyncio.TimeoutError:
-                    logger.warning("Some tasks did not complete within timeout")
+                    logger.warning("[SHUTDOWN] Market data save timed out")
+                except Exception as e:
+                    logger.error(f"[SHUTDOWN] Error saving candles: {e}")
+                
+                try:
+                    self.market_data.disconnect()
+                    log_progress("MarketData", "disconnected ✓")
+                except Exception as e:
+                    logger.error(f"[SHUTDOWN] Error disconnecting market data: {e}")
             
-            logger.info("Stopping background cleanup tasks...")
+            log_progress("Telegram", "stopping bot")
             if self.telegram_bot:
                 try:
-                    await asyncio.wait_for(self.telegram_bot.stop_background_cleanup_tasks(), timeout=5)
+                    await asyncio.wait_for(
+                        self.telegram_bot.stop_background_cleanup_tasks(),
+                        timeout=5
+                    )
                 except asyncio.TimeoutError:
-                    logger.warning("Background cleanup tasks shutdown timed out")
+                    logger.warning("[SHUTDOWN] Background cleanup tasks shutdown timed out")
                 except Exception as e:
-                    logger.error(f"Error stopping background cleanup tasks: {e}")
-            
-            logger.info("Stopping Telegram bot...")
-            if self.telegram_bot:
+                    logger.error(f"[SHUTDOWN] Error stopping background cleanup tasks: {e}")
+                
                 try:
-                    await asyncio.wait_for(self.telegram_bot.stop(), timeout=8)
+                    await asyncio.wait_for(
+                        self.telegram_bot.stop(),
+                        timeout=self.SHUTDOWN_PHASE_TIMEOUT
+                    )
+                    log_progress("Telegram", "stopped ✓")
                 except asyncio.TimeoutError:
-                    logger.warning(f"Telegram bot shutdown timed out after 8s")
+                    logger.warning("[SHUTDOWN] Telegram bot shutdown timed out")
                 except Exception as e:
-                    logger.error(f"Error stopping Telegram bot: {e}")
+                    logger.error(f"[SHUTDOWN] Error stopping Telegram bot: {e}")
             
-            logger.info("Stopping position tracker...")
+            log_progress("TaskScheduler", "stopping")
+            if self.task_scheduler:
+                try:
+                    await asyncio.wait_for(
+                        self.task_scheduler.stop(),
+                        timeout=self.SHUTDOWN_PHASE_TIMEOUT
+                    )
+                    log_progress("TaskScheduler", "stopped ✓")
+                except asyncio.TimeoutError:
+                    logger.warning("[SHUTDOWN] Task scheduler shutdown timed out")
+                except Exception as e:
+                    logger.error(f"[SHUTDOWN] Error stopping task scheduler: {e}")
+            
+            log_progress("PositionTracker", "stopping")
             if self.position_tracker:
                 try:
                     self.position_tracker.stop_monitoring()
+                    log_progress("PositionTracker", "stopped ✓")
                 except Exception as e:
-                    logger.error(f"Error stopping position tracker: {e}")
+                    logger.error(f"[SHUTDOWN] Error stopping position tracker: {e}")
             
-            logger.info("Stopping task scheduler...")
-            if self.task_scheduler:
-                try:
-                    await asyncio.wait_for(self.task_scheduler.stop(), timeout=5)
-                except asyncio.TimeoutError:
-                    logger.warning(f"Task scheduler shutdown timed out after 5s")
-                except Exception as e:
-                    logger.error(f"Error stopping task scheduler: {e}")
+            log_progress("RegisteredTasks", "cancelling all")
+            cancelled = await self._cancel_all_registered_tasks(timeout=10.0)
+            log_progress("RegisteredTasks", f"cancelled {cancelled} tasks ✓")
             
-            logger.info("Stopping chart generator...")
+            log_progress("ChartGenerator", "shutting down")
             if self.chart_generator:
                 try:
                     self.chart_generator.shutdown()
+                    log_progress("ChartGenerator", "shutdown ✓")
                 except Exception as e:
-                    logger.error(f"Error shutting down chart generator: {e}")
+                    logger.error(f"[SHUTDOWN] Error shutting down chart generator: {e}")
             
-            logger.info("Saving candles to database...")
-            if self.market_data:
+            log_progress("HTTPServer", "stopping health server")
+            if self.health_server:
                 try:
-                    await self.market_data.save_candles_to_db(self.db_manager)
+                    await asyncio.wait_for(
+                        self.health_server.cleanup(),
+                        timeout=5
+                    )
+                    log_progress("HTTPServer", "stopped ✓")
+                except asyncio.TimeoutError:
+                    logger.warning("[SHUTDOWN] Health server shutdown timed out")
                 except Exception as e:
-                    logger.error(f"Error saving candles: {e}")
+                    logger.error(f"[SHUTDOWN] Error stopping health server: {e}")
             
-            logger.info("Stopping market data connection...")
-            if self.market_data:
-                try:
-                    self.market_data.disconnect()
-                except Exception as e:
-                    logger.error(f"Error disconnecting market data: {e}")
-            
-            logger.info("Closing database connections...")
+            log_progress("Database", "closing connections")
             if self.db_manager:
                 try:
                     self.db_manager.close()
+                    log_progress("Database", "closed ✓")
                 except Exception as e:
-                    logger.error(f"Error closing database: {e}")
-            
-            logger.info("Stopping health server...")
-            if self.health_server:
-                try:
-                    await asyncio.wait_for(self.health_server.cleanup(), timeout=5)
-                except asyncio.TimeoutError:
-                    logger.warning(f"Health server shutdown timed out after 5s")
-                except Exception as e:
-                    logger.error(f"Error stopping health server: {e}")
+                    logger.error(f"[SHUTDOWN] Error closing database: {e}")
             
             shutdown_duration = loop.time() - shutdown_start_time
-            logger.info(f"Shutdown completed in {shutdown_duration:.2f}s")
-            
-            if shutdown_duration > shutdown_timeout:
-                logger.warning(f"Graceful shutdown exceeded timeout ({shutdown_duration:.2f}s > {shutdown_timeout}s)")
             
             logger.info("=" * 60)
-            logger.info("BOT SHUTDOWN COMPLETE")
+            logger.info(f"[SHUTDOWN] COMPLETE in {shutdown_duration:.2f}s")
+            if shutdown_duration > self.SHUTDOWN_TOTAL_TIMEOUT:
+                logger.warning(f"[SHUTDOWN] Exceeded timeout ({shutdown_duration:.2f}s > {self.SHUTDOWN_TOTAL_TIMEOUT}s)")
             logger.info("=" * 60)
             
             import logging
             logging.shutdown()
             
         except Exception as e:
-            logger.error(f"Error during shutdown: {e}")
+            logger.error(f"[SHUTDOWN] Error during shutdown: {e}")
             import logging
             logging.shutdown()
             raise
         finally:
-            self.shutdown_in_progress = False
+            self._shutdown_in_progress = False
+
 
 async def main():
     orchestrator = TradingBotOrchestrator()
     loop = asyncio.get_running_loop()
     
+    shutdown_requested = False
+    
     def signal_handler(sig, frame):
+        nonlocal shutdown_requested
         signame = signal.Signals(sig).name
-        logger.info(f"Received signal {signame} ({sig})")
+        
+        if shutdown_requested:
+            orchestrator._shutdown_count += 1
+            logger.warning(f"[SIGNAL] Received {signame} again (count: {orchestrator._shutdown_count})")
+            if orchestrator._shutdown_count >= 3:
+                logger.error("[SIGNAL] Forced exit after 3 signals")
+                sys.exit(1)
+            return
+        
+        shutdown_requested = True
+        logger.info(f"[SIGNAL] Received {signame} ({sig}), initiating graceful shutdown...")
+        
         try:
             loop.call_soon_threadsafe(orchestrator.shutdown_event.set)
         except RuntimeError:
@@ -775,14 +1015,15 @@ async def main():
         await orchestrator.start()
         return 0
     except KeyboardInterrupt:
-        logger.info("KeyboardInterrupt received")
+        logger.info("[SIGNAL] KeyboardInterrupt received")
         return 0
     except Exception as e:
-        logger.error(f"Unhandled exception in main: {e}")
+        logger.error(f"[MAIN] Unhandled exception: {e}")
         return 1
     finally:
         if not orchestrator.shutdown_in_progress:
             await orchestrator.shutdown()
+
 
 if __name__ == "__main__":
     exit_code = 1

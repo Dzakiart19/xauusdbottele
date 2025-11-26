@@ -1,6 +1,9 @@
 import asyncio
+import json
+import os
+import pickle
 from datetime import datetime, timedelta
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Any
 from collections import deque
 import time
 import pytz
@@ -17,6 +20,10 @@ MAX_RETRY_ATTEMPTS = 3
 BASE_BACKOFF_SECONDS = 1.0
 MAX_BACKOFF_SECONDS = 60.0
 HISTORY_CLEANUP_INTERVAL_SECONDS = 300
+QUEUE_PERSISTENCE_PATH = "data/alert_queue_state.json"
+RATE_LIMITER_STATE_PATH = "data/rate_limiter_state.json"
+HISTORY_CLEANUP_BACKOFF_BASE = 60.0
+HISTORY_CLEANUP_BACKOFF_MAX = 3600.0
 
 
 class AlertPriority:
@@ -561,3 +568,238 @@ class AlertSystem:
             'rate_limiter': self.rate_limiter.get_state(),
             'circuit_breaker': self.circuit_breaker.get_state()
         }
+    
+    def save_queue_state(self, filepath: Optional[str] = None) -> bool:
+        """Persist queue and rate limiter state to file
+        
+        Args:
+            filepath: Optional custom path, defaults to QUEUE_PERSISTENCE_PATH
+            
+        Returns:
+            True if save successful, False otherwise
+        """
+        filepath = filepath or QUEUE_PERSISTENCE_PATH
+        
+        try:
+            os.makedirs(os.path.dirname(filepath), exist_ok=True)
+            
+            queue_data = []
+            for alert in self.alert_queue:
+                try:
+                    queue_data.append(alert.to_dict())
+                except Exception as e:
+                    logger.warning(f"Could not serialize alert: {e}")
+            
+            state = {
+                'version': 1,
+                'timestamp': datetime.now(pytz.UTC).isoformat(),
+                'queue': queue_data,
+                'stats': {
+                    'current_backoff': self._current_backoff,
+                    'failed_sends': self._failed_sends,
+                    'total_dropped': self._total_dropped,
+                    'total_rejected': self._total_rejected,
+                    'critical_dropped': self._critical_dropped,
+                    'last_history_cleanup': self._last_history_cleanup,
+                    'history_cleanup_failures': getattr(self, '_history_cleanup_failures', 0),
+                },
+                'rate_limiter_state': self._serialize_rate_limiter_state()
+            }
+            
+            with open(filepath, 'w') as f:
+                json.dump(state, f, indent=2, default=str)
+            
+            logger.info(
+                f"Queue state saved: {len(queue_data)} alerts, "
+                f"backoff={self._current_backoff:.1f}s"
+            )
+            return True
+            
+        except PermissionError as e:
+            logger.error(f"Permission denied saving queue state to {filepath}: {e}")
+            return False
+        except OSError as e:
+            logger.error(f"OS error saving queue state to {filepath}: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Unexpected error saving queue state: {type(e).__name__}: {e}")
+            return False
+    
+    def restore_queue_state(self, filepath: Optional[str] = None) -> bool:
+        """Restore queue and rate limiter state from file
+        
+        Args:
+            filepath: Optional custom path, defaults to QUEUE_PERSISTENCE_PATH
+            
+        Returns:
+            True if restore successful, False otherwise
+        """
+        filepath = filepath or QUEUE_PERSISTENCE_PATH
+        
+        try:
+            if not os.path.exists(filepath):
+                logger.info(f"No queue state file found at {filepath}")
+                return False
+            
+            with open(filepath, 'r') as f:
+                state = json.load(f)
+            
+            version = state.get('version', 0)
+            if version != 1:
+                logger.warning(f"Unknown queue state version: {version}")
+            
+            saved_time_str = state.get('timestamp')
+            if saved_time_str:
+                try:
+                    saved_time = datetime.fromisoformat(saved_time_str.replace('Z', '+00:00'))
+                    age_seconds = (datetime.now(pytz.UTC) - saved_time).total_seconds()
+                    if age_seconds > 3600:
+                        logger.warning(
+                            f"Queue state is {age_seconds/3600:.1f} hours old, "
+                            "some alerts may be stale"
+                        )
+                except Exception:
+                    pass
+            
+            restored_count = 0
+            queue_data = state.get('queue', [])
+            for alert_dict in queue_data:
+                try:
+                    alert = Alert(
+                        alert_type=alert_dict.get('alert_type', 'UNKNOWN'),
+                        message=alert_dict.get('message', ''),
+                        priority=alert_dict.get('priority', 'NORMAL'),
+                        data=alert_dict.get('data', {})
+                    )
+                    
+                    timestamp_str = alert_dict.get('timestamp')
+                    if timestamp_str:
+                        try:
+                            alert.timestamp = datetime.fromisoformat(
+                                timestamp_str.replace('Z', '+00:00')
+                            )
+                        except Exception:
+                            pass
+                    
+                    alert.sent = alert_dict.get('sent', False)
+                    alert.retry_count = alert_dict.get('retry_count', 0)
+                    alert.last_error = alert_dict.get('last_error')
+                    
+                    if not alert.sent:
+                        self.alert_queue.append(alert)
+                        restored_count += 1
+                        
+                except Exception as e:
+                    logger.warning(f"Could not restore alert: {e}")
+            
+            stats = state.get('stats', {})
+            self._current_backoff = stats.get('current_backoff', BASE_BACKOFF_SECONDS)
+            self._failed_sends = stats.get('failed_sends', 0)
+            self._total_dropped = stats.get('total_dropped', 0)
+            self._total_rejected = stats.get('total_rejected', 0)
+            self._critical_dropped = stats.get('critical_dropped', 0)
+            self._last_history_cleanup = stats.get('last_history_cleanup', time.time())
+            self._history_cleanup_failures = stats.get('history_cleanup_failures', 0)
+            
+            rate_limiter_state = state.get('rate_limiter_state', {})
+            self._restore_rate_limiter_state(rate_limiter_state)
+            
+            logger.info(
+                f"Queue state restored: {restored_count} alerts, "
+                f"backoff={self._current_backoff:.1f}s"
+            )
+            return True
+            
+        except json.JSONDecodeError as e:
+            logger.error(f"Invalid JSON in queue state file: {e}")
+            return False
+        except PermissionError as e:
+            logger.error(f"Permission denied reading queue state from {filepath}: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Unexpected error restoring queue state: {type(e).__name__}: {e}")
+            return False
+    
+    def _serialize_rate_limiter_state(self) -> Dict[str, Any]:
+        """Serialize rate limiter state for persistence"""
+        try:
+            state = self.rate_limiter.get_state()
+            if hasattr(self.rate_limiter, '_calls'):
+                state['calls'] = [
+                    ts.isoformat() if isinstance(ts, datetime) else str(ts)
+                    for ts in getattr(self.rate_limiter, '_calls', [])
+                ]
+            return state
+        except Exception as e:
+            logger.warning(f"Could not serialize rate limiter state: {e}")
+            return {}
+    
+    def _restore_rate_limiter_state(self, state: Dict[str, Any]):
+        """Restore rate limiter state from persisted data"""
+        try:
+            if not state:
+                return
+            
+            if hasattr(self.rate_limiter, '_calls') and 'calls' in state:
+                restored_calls = []
+                for ts_str in state.get('calls', []):
+                    try:
+                        dt = datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
+                        if (datetime.now(pytz.UTC) - dt).total_seconds() < self.rate_limiter._time_window:
+                            restored_calls.append(dt)
+                    except Exception:
+                        pass
+                self.rate_limiter._calls = restored_calls
+                logger.debug(f"Restored {len(restored_calls)} rate limiter calls")
+                
+        except Exception as e:
+            logger.warning(f"Could not restore rate limiter state: {e}")
+    
+    async def periodic_history_cleanup_with_backoff(self):
+        """Run periodic history cleanup with exponential backoff on failures"""
+        cleanup_failures = getattr(self, '_history_cleanup_failures', 0)
+        
+        while True:
+            try:
+                cleanup_interval = HISTORY_CLEANUP_INTERVAL_SECONDS
+                if cleanup_failures > 0:
+                    backoff = min(
+                        HISTORY_CLEANUP_BACKOFF_BASE * (2 ** cleanup_failures),
+                        HISTORY_CLEANUP_BACKOFF_MAX
+                    )
+                    cleanup_interval = max(cleanup_interval, backoff)
+                    logger.info(
+                        f"History cleanup using backoff: {cleanup_interval:.0f}s "
+                        f"(failures: {cleanup_failures})"
+                    )
+                
+                await asyncio.sleep(cleanup_interval)
+                
+                await self._cleanup_old_history()
+                
+                self.save_queue_state()
+                
+                cleanup_failures = 0
+                self._history_cleanup_failures = 0
+                
+            except asyncio.CancelledError:
+                logger.info("History cleanup task cancelled")
+                self.save_queue_state()
+                raise
+            except Exception as e:
+                cleanup_failures += 1
+                self._history_cleanup_failures = cleanup_failures
+                logger.error(
+                    f"History cleanup failed (attempt {cleanup_failures}): "
+                    f"{type(e).__name__}: {e}"
+                )
+    
+    def start_periodic_cleanup(self) -> asyncio.Task:
+        """Start the periodic history cleanup background task
+        
+        Returns:
+            The created asyncio Task
+        """
+        task = asyncio.create_task(self.periodic_history_cleanup_with_backoff())
+        logger.info("Started periodic history cleanup task")
+        return task

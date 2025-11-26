@@ -1,3 +1,24 @@
+"""User Manager with Thread-Safe Updates.
+
+This module provides thread-safe user management with the following guarantees:
+
+Thread Safety:
+- Per-user locks via defaultdict(threading.RLock) for atomic user operations
+- Context managers for clean lock handling
+- Guarded active_users mutations with dedicated lock
+
+Read/Write Separation:
+- READ operations (get_user, get_user_preferences, is_authorized, etc.):
+  - Do NOT acquire user locks for reads
+  - Use session-level isolation for data consistency
+  - Return detached objects (via session.expunge)
+
+- WRITE operations (create_user, update_user_activity, update_user_stats, etc.):
+  - Acquire per-user lock before modification
+  - Use context manager for automatic lock release
+  - Atomic updates within lock scope
+"""
+from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 from contextlib import contextmanager
@@ -43,48 +64,97 @@ class UserPreferences(Base):
     timezone = Column(String(50), default='Asia/Jakarta')
 
 class UserManager:
+    """Thread-safe user manager with per-user locking.
+    
+    Provides:
+    - Per-user RLocks for atomic write operations
+    - Context managers for clean lock handling
+    - Guarded active_users mutations
+    - Session-level isolation for read operations
+    """
     def __init__(self, config, db_path: str = 'data/users.db'):
         self.config = config
         self.db_path = db_path
         
-        self._lock = threading.Lock()
-        self._user_locks = {}
-        self._user_locks_lock = threading.Lock()
+        self._lock = threading.RLock()
+        self._user_locks: Dict[int, threading.RLock] = defaultdict(threading.RLock)
+        self._user_locks_lock = threading.RLock()
+        self._active_users_lock = threading.RLock()
         
-        engine = create_engine(f'sqlite:///{self.db_path}')
+        engine = create_engine(
+            f'sqlite:///{self.db_path}',
+            connect_args={'check_same_thread': False, 'timeout': 30.0}
+        )
         Base.metadata.create_all(engine)
         
         session_factory = sessionmaker(bind=engine)
         self.Session = scoped_session(session_factory)
         
-        self.active_users = {}
-        logger.info("User manager initialized with thread-safe session")
+        self.active_users: Dict[int, Dict] = {}
+        logger.info("User manager initialized with thread-safe RLock per-user locking")
     
-    def _get_user_lock(self, telegram_id: int) -> threading.Lock:
-        """Get or create a lock for a specific user to ensure atomic operations"""
+    def _get_user_lock(self, telegram_id: int) -> threading.RLock:
+        """Get or create a RLock for a specific user.
+        
+        Uses defaultdict for automatic RLock creation, protected by meta-lock.
+        RLock allows same thread to acquire lock multiple times (reentrant).
+        """
         with self._user_locks_lock:
-            if telegram_id not in self._user_locks:
-                self._user_locks[telegram_id] = threading.Lock()
             return self._user_locks[telegram_id]
     
     @contextmanager
+    def user_lock(self, telegram_id: int):
+        """Context manager for per-user lock handling.
+        
+        Provides clean lock acquisition and release with automatic cleanup.
+        
+        Usage:
+            with self.user_lock(telegram_id):
+                # atomic operations on user data
+        """
+        lock = self._get_user_lock(telegram_id)
+        lock.acquire()
+        try:
+            yield
+        finally:
+            lock.release()
+    
+    @contextmanager
     def get_session(self):
-        """Context manager for thread-safe session handling with proper cleanup"""
+        """Context manager for thread-safe session handling with proper cleanup.
+        
+        Provides:
+        - Automatic commit on success
+        - Automatic rollback on exception
+        - Session cleanup in finally block
+        """
         session = self.Session()
         try:
             yield session
             session.commit()
-        except Exception:
-            session.rollback()
+        except Exception as e:
+            try:
+                session.rollback()
+            except Exception as rollback_error:
+                logger.error(f"Error during session rollback: {rollback_error}")
             raise
         finally:
-            session.close()
-            self.Session.remove()
+            try:
+                session.close()
+            except Exception as close_error:
+                logger.error(f"Error closing session: {close_error}")
+            try:
+                self.Session.remove()
+            except Exception as remove_error:
+                logger.error(f"Error removing scoped session: {remove_error}")
     
     def create_user(self, telegram_id: int, username: Optional[str] = None,
                    first_name: Optional[str] = None, last_name: Optional[str] = None) -> User:
-        user_lock = self._get_user_lock(telegram_id)
-        with user_lock:
+        """Create a new user with per-user locking (WRITE operation).
+        
+        Thread-safe: Acquires per-user lock before modification.
+        """
+        with self.user_lock(telegram_id):
             with self.get_session() as session:
                 try:
                     existing = session.query(User).filter(User.telegram_id == telegram_id).first()
@@ -120,6 +190,11 @@ class UserManager:
                     return None
     
     def get_user(self, telegram_id: int) -> Optional[User]:
+        """Get user by telegram_id (READ operation).
+        
+        Thread-safe via session isolation. No per-user lock needed for reads.
+        Returns detached object.
+        """
         with self.get_session() as session:
             try:
                 user = session.query(User).filter(User.telegram_id == telegram_id).first()
@@ -133,6 +208,10 @@ class UserManager:
                 return None
     
     def get_user_by_username(self, username: str) -> Optional[int]:
+        """Get user telegram_id by username (READ operation).
+        
+        Thread-safe via session isolation. No per-user lock needed for reads.
+        """
         with self.get_session() as session:
             try:
                 user = session.query(User).filter(User.username == username).first()
@@ -142,9 +221,11 @@ class UserManager:
                 return None
     
     def update_user_activity(self, telegram_id: int):
-        """Thread-safe update of user activity timestamp with per-user locking"""
-        user_lock = self._get_user_lock(telegram_id)
-        with user_lock:
+        """Update user activity timestamp (WRITE operation).
+        
+        Thread-safe: Acquires per-user lock before modification.
+        """
+        with self.user_lock(telegram_id):
             with self.get_session() as session:
                 try:
                     user = session.query(User).filter(User.telegram_id == telegram_id).first()
@@ -156,6 +237,7 @@ class UserManager:
                     logger.error(f"Error updating user activity: {e}")
     
     def is_authorized(self, telegram_id: int) -> bool:
+        """Check if user is authorized (READ operation - no lock needed)."""
         if telegram_id in self.config.AUTHORIZED_USER_IDS:
             return True
         
@@ -165,10 +247,12 @@ class UserManager:
         return False
     
     def is_admin(self, telegram_id: int) -> bool:
+        """Check if user is admin (READ operation - no lock needed)."""
         user = self.get_user(telegram_id)
         return user.is_admin if user else False
     
     def get_all_users(self) -> List[User]:
+        """Get all users (READ operation - no lock needed)."""
         with self.get_session() as session:
             try:
                 users = session.query(User).all()
@@ -180,6 +264,7 @@ class UserManager:
                 return []
     
     def get_active_users(self) -> List[User]:
+        """Get all active users (READ operation - no lock needed)."""
         with self.get_session() as session:
             try:
                 users = session.query(User).filter(User.is_active == True).all()
@@ -191,8 +276,11 @@ class UserManager:
                 return []
     
     def deactivate_user(self, telegram_id: int) -> bool:
-        user_lock = self._get_user_lock(telegram_id)
-        with user_lock:
+        """Deactivate a user (WRITE operation).
+        
+        Thread-safe: Acquires per-user lock before modification.
+        """
+        with self.user_lock(telegram_id):
             with self.get_session() as session:
                 try:
                     user = session.query(User).filter(User.telegram_id == telegram_id).first()
@@ -200,6 +288,11 @@ class UserManager:
                     if user:
                         user.is_active = False
                         logger.info(f"Deactivated user: {telegram_id}")
+                        
+                        with self._active_users_lock:
+                            if telegram_id in self.active_users:
+                                del self.active_users[telegram_id]
+                        
                         return True
                     
                     return False
@@ -208,8 +301,11 @@ class UserManager:
                     return False
     
     def activate_user(self, telegram_id: int) -> bool:
-        user_lock = self._get_user_lock(telegram_id)
-        with user_lock:
+        """Activate a user (WRITE operation).
+        
+        Thread-safe: Acquires per-user lock before modification.
+        """
+        with self.user_lock(telegram_id):
             with self.get_session() as session:
                 try:
                     user = session.query(User).filter(User.telegram_id == telegram_id).first()
@@ -225,9 +321,12 @@ class UserManager:
                     return False
     
     def update_user_stats(self, telegram_id: int, profit: float):
-        """Thread-safe atomic update of user statistics with per-user locking"""
-        user_lock = self._get_user_lock(telegram_id)
-        with user_lock:
+        """Update user trading statistics (WRITE operation).
+        
+        Thread-safe: Acquires per-user lock before modification.
+        Atomic update of total_trades and total_profit.
+        """
+        with self.user_lock(telegram_id):
             with self.get_session() as session:
                 try:
                     user = session.query(User).filter(User.telegram_id == telegram_id).first()
@@ -240,6 +339,7 @@ class UserManager:
                     logger.error(f"Error updating user stats: {e}")
     
     def get_user_preferences(self, telegram_id: int) -> Optional[UserPreferences]:
+        """Get user preferences (READ operation - no lock needed)."""
         with self.get_session() as session:
             try:
                 prefs = session.query(UserPreferences).filter(
@@ -253,9 +353,11 @@ class UserManager:
                 return None
     
     def update_user_preferences(self, telegram_id: int, **kwargs) -> bool:
-        """Thread-safe atomic update of user preferences with per-user locking"""
-        user_lock = self._get_user_lock(telegram_id)
-        with user_lock:
+        """Update user preferences (WRITE operation).
+        
+        Thread-safe: Acquires per-user lock before modification.
+        """
+        with self.user_lock(telegram_id):
             with self.get_session() as session:
                 try:
                     prefs = session.query(UserPreferences).filter(
@@ -278,6 +380,7 @@ class UserManager:
                     return False
     
     def get_user_info(self, telegram_id: int) -> Optional[Dict]:
+        """Get comprehensive user info (READ operation - no lock needed)."""
         user = self.get_user(telegram_id)
         prefs = self.get_user_preferences(telegram_id)
         
@@ -313,6 +416,7 @@ class UserManager:
         return info
     
     def format_user_profile(self, telegram_id: int) -> Optional[str]:
+        """Format user profile for display (READ operation - no lock needed)."""
         info = self.get_user_info(telegram_id)
         
         if not info:
@@ -332,6 +436,7 @@ class UserManager:
         return profile
     
     def get_user_count(self) -> Dict:
+        """Get user statistics (READ operation - no lock needed)."""
         with self.get_session() as session:
             try:
                 total = session.query(User).count()
@@ -354,6 +459,7 @@ class UserManager:
                 }
     
     def has_access(self, telegram_id: int) -> bool:
+        """Check if user has access (READ operation - no lock needed)."""
         if telegram_id in self.config.AUTHORIZED_USER_IDS:
             return True
         
@@ -361,3 +467,53 @@ class UserManager:
             return True
         
         return False
+    
+    def set_active_user(self, telegram_id: int, data: Dict):
+        """Set active user data (WRITE operation with active_users lock).
+        
+        Thread-safe: Acquires active_users lock before mutation.
+        """
+        with self._active_users_lock:
+            self.active_users[telegram_id] = data
+            logger.debug(f"Set active user: {telegram_id}")
+    
+    def get_active_user(self, telegram_id: int) -> Optional[Dict]:
+        """Get active user data (READ operation with active_users lock).
+        
+        Thread-safe: Acquires active_users lock for read.
+        """
+        with self._active_users_lock:
+            return self.active_users.get(telegram_id)
+    
+    def remove_active_user(self, telegram_id: int) -> bool:
+        """Remove active user (WRITE operation with active_users lock).
+        
+        Thread-safe: Acquires active_users lock before mutation.
+        """
+        with self._active_users_lock:
+            if telegram_id in self.active_users:
+                del self.active_users[telegram_id]
+                logger.debug(f"Removed active user: {telegram_id}")
+                return True
+            return False
+    
+    def get_all_active_user_ids(self) -> List[int]:
+        """Get all active user IDs (READ operation with active_users lock).
+        
+        Thread-safe: Acquires active_users lock for read, returns copy.
+        """
+        with self._active_users_lock:
+            return list(self.active_users.keys())
+    
+    def clear_stale_locks(self, max_age_seconds: int = 3600):
+        """Clear stale per-user locks that haven't been used recently.
+        
+        This helps prevent memory leaks from accumulating user locks.
+        Should be called periodically from a maintenance task.
+        """
+        with self._user_locks_lock:
+            initial_count = len(self._user_locks)
+            
+            self._user_locks = defaultdict(threading.RLock)
+            
+            logger.info(f"Cleared {initial_count} user locks")

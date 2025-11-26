@@ -1,6 +1,93 @@
 import pandas as pd
 import numpy as np
-from typing import Dict, Optional
+from typing import Dict, Optional, Union
+
+def validate_series(series: pd.Series, min_length: int = 1, fill_value: float = 0.0) -> pd.Series:
+    """
+    Validate and sanitize a pandas Series before mathematical operations.
+    
+    Args:
+        series: The pandas Series to validate
+        min_length: Minimum required length
+        fill_value: Value to use for filling NaN/None values
+    
+    Returns:
+        Validated Series with NaN values filled
+    
+    Raises:
+        ValueError: If series is None or not a pandas Series
+    """
+    if series is None:
+        raise ValueError("Series cannot be None")
+    
+    if not isinstance(series, pd.Series):
+        raise ValueError(f"Expected pandas Series, got {type(series)}")
+    
+    if len(series) < min_length:
+        return pd.Series([fill_value] * min_length)
+    
+    return series.fillna(fill_value)
+
+
+def safe_divide(numerator: pd.Series, denominator: pd.Series, fill_value: float = 0.0) -> pd.Series:
+    """
+    Safely divide two Series, handling division by zero and NaN values.
+    
+    Args:
+        numerator: Numerator Series
+        denominator: Denominator Series
+        fill_value: Value to use when division is undefined
+    
+    Returns:
+        Result Series with safe division
+    """
+    with np.errstate(divide='ignore', invalid='ignore'):
+        result = numerator / denominator
+        result = result.replace([np.inf, -np.inf], fill_value)
+        result = result.fillna(fill_value)
+    return result
+
+
+def safe_series_operation(series: pd.Series, operation: str = 'value', 
+                          index: int = -1, default: float = 0.0) -> float:
+    """
+    Safely extract a value from a Series with null checking.
+    
+    Args:
+        series: The pandas Series
+        operation: Type of operation ('value', 'mean', 'sum', 'min', 'max')
+        index: Index position for 'value' operation
+        default: Default value if operation fails
+    
+    Returns:
+        The extracted value or default
+    """
+    try:
+        if series is None or len(series) == 0:
+            return default
+        
+        if operation == 'value':
+            if abs(index) > len(series):
+                return default
+            val = series.iloc[index]
+            return default if pd.isna(val) else float(val)
+        elif operation == 'mean':
+            val = series.mean()
+            return default if pd.isna(val) else float(val)
+        elif operation == 'sum':
+            val = series.sum()
+            return default if pd.isna(val) else float(val)
+        elif operation == 'min':
+            val = series.min()
+            return default if pd.isna(val) else float(val)
+        elif operation == 'max':
+            val = series.max()
+            return default if pd.isna(val) else float(val)
+        else:
+            return default
+    except (IndexError, KeyError, TypeError):
+        return default
+
 
 class IndicatorEngine:
     def __init__(self, config):
@@ -16,40 +103,162 @@ class IndicatorEngine:
         self.macd_slow = config.MACD_SLOW
         self.macd_signal = config.MACD_SIGNAL
     
+    def _validate_dataframe(self, df: pd.DataFrame, required_columns: Optional[list] = None) -> bool:
+        """
+        Validate DataFrame has required columns and sufficient data.
+        
+        Args:
+            df: DataFrame to validate
+            required_columns: List of required column names
+        
+        Returns:
+            True if valid, False otherwise
+        """
+        if df is None or not isinstance(df, pd.DataFrame):
+            return False
+        
+        if len(df) == 0:
+            return False
+        
+        if required_columns is None:
+            required_columns = ['open', 'high', 'low', 'close']
+        
+        for col in required_columns:
+            if col not in df.columns:
+                return False
+        
+        return True
+    
+    def _get_column_series(self, df: pd.DataFrame, column: str, fill_value: float = 0.0) -> pd.Series:
+        """
+        Safely get a column from DataFrame with null handling.
+        
+        Args:
+            df: Source DataFrame
+            column: Column name
+            fill_value: Value to fill NaN with
+        
+        Returns:
+            Validated Series
+        """
+        if column not in df.columns:
+            return pd.Series([fill_value] * len(df), index=df.index)
+        
+        return df[column].fillna(fill_value)
+    
     def calculate_ema(self, df: pd.DataFrame, period: int) -> pd.Series:
-        return df['close'].ewm(span=period, adjust=False).mean()
+        """Calculate Exponential Moving Average with null handling."""
+        if not self._validate_dataframe(df, ['close']):
+            return pd.Series([0.0])
+        
+        close = self._get_column_series(df, 'close')
+        if len(close) < period:
+            return pd.Series([0.0] * len(close), index=df.index)
+        
+        result = close.ewm(span=period, adjust=False).mean()
+        return result.fillna(0.0)
     
     def calculate_rsi(self, df: pd.DataFrame, period: int) -> pd.Series:
-        delta = df['close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+        """Calculate RSI with proper null handling for division operations."""
+        if not self._validate_dataframe(df, ['close']):
+            return pd.Series([50.0])
         
-        rs = gain / loss
+        close = self._get_column_series(df, 'close')
+        if len(close) < period + 1:
+            return pd.Series([50.0] * len(close), index=df.index)
+        
+        delta = close.diff()
+        delta = delta.fillna(0.0)
+        
+        gain = delta.where(delta > 0, 0.0)
+        loss = (-delta.where(delta < 0, 0.0))
+        
+        avg_gain = gain.rolling(window=period, min_periods=1).mean()
+        avg_loss = loss.rolling(window=period, min_periods=1).mean()
+        
+        avg_gain = avg_gain.fillna(0.0)
+        avg_loss = avg_loss.fillna(0.0)
+        
+        rs = safe_divide(avg_gain, avg_loss, fill_value=0.0)
+        
         rsi = 100 - (100 / (1 + rs))
+        rsi = rsi.fillna(50.0)
+        rsi = rsi.clip(0, 100)
+        
         return rsi
     
     def calculate_stochastic(self, df: pd.DataFrame, k_period: int, d_period: int, smooth_k: int) -> tuple:
-        low_min = df['low'].rolling(window=k_period).min()
-        high_max = df['high'].rolling(window=k_period).max()
+        """Calculate Stochastic oscillator with null handling."""
+        if not self._validate_dataframe(df, ['high', 'low', 'close']):
+            empty_series = pd.Series([50.0])
+            return empty_series, empty_series
         
-        stoch_k = 100 * (df['close'] - low_min) / (high_max - low_min)
-        stoch_k = stoch_k.rolling(window=smooth_k).mean()
-        stoch_d = stoch_k.rolling(window=d_period).mean()
+        high = self._get_column_series(df, 'high')
+        low = self._get_column_series(df, 'low')
+        close = self._get_column_series(df, 'close')
+        
+        if len(df) < k_period:
+            empty_series = pd.Series([50.0] * len(df), index=df.index)
+            return empty_series, empty_series
+        
+        low_min = low.rolling(window=k_period, min_periods=1).min()
+        high_max = high.rolling(window=k_period, min_periods=1).max()
+        
+        low_min = low_min.fillna(low)
+        high_max = high_max.fillna(high)
+        
+        range_diff = high_max - low_min
+        range_diff = range_diff.replace(0, 1e-10)
+        
+        stoch_k = 100 * safe_divide(close - low_min, range_diff, fill_value=50.0)
+        stoch_k = stoch_k.fillna(50.0).clip(0, 100)
+        
+        stoch_k = stoch_k.rolling(window=smooth_k, min_periods=1).mean()
+        stoch_d = stoch_k.rolling(window=d_period, min_periods=1).mean()
+        
+        stoch_k = stoch_k.fillna(50.0)
+        stoch_d = stoch_d.fillna(50.0)
         
         return stoch_k, stoch_d
     
     def calculate_atr(self, df: pd.DataFrame, period: int) -> pd.Series:
-        high_low = df['high'] - df['low']
-        high_close = np.abs(df['high'] - df['close'].shift())
-        low_close = np.abs(df['low'] - df['close'].shift())
+        """Calculate Average True Range with null handling."""
+        if not self._validate_dataframe(df, ['high', 'low', 'close']):
+            return pd.Series([0.0])
+        
+        high = self._get_column_series(df, 'high')
+        low = self._get_column_series(df, 'low')
+        close = self._get_column_series(df, 'close')
+        
+        if len(df) < 2:
+            return pd.Series([0.0] * len(df), index=df.index)
+        
+        prev_close = close.shift(1).fillna(close)
+        
+        high_low = (high - low).abs()
+        high_close = (high - prev_close).abs()
+        low_close = (low - prev_close).abs()
         
         tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-        atr = tr.rolling(window=period).mean()
+        tr = tr.fillna(0.0)
+        
+        atr = tr.rolling(window=period, min_periods=1).mean()
+        atr = atr.fillna(0.0)
         
         return atr
     
     def calculate_volume_average(self, df: pd.DataFrame, period: int = 20) -> pd.Series:
-        return df['volume'].rolling(window=period).mean()
+        """Calculate volume average with null handling."""
+        if not self._validate_dataframe(df, ['volume']):
+            return pd.Series([0.0])
+        
+        volume = self._get_column_series(df, 'volume')
+        
+        if len(volume) < period:
+            return volume.rolling(window=len(volume), min_periods=1).mean().fillna(0.0)
+        
+        result = volume.rolling(window=period, min_periods=1).mean()
+        return result.fillna(0.0)
     
     def calculate_twin_range_filter(self, df: pd.DataFrame, period: int = 27, multiplier: float = 2.0) -> tuple:
         """
@@ -64,29 +273,43 @@ class IndicatorEngine:
             tuple: (upper_filter, lower_filter, trend_direction)
                    trend_direction: 1 untuk bullish, -1 untuk bearish, 0 untuk neutral
         """
-        close = df['close']
-        high = df['high']
-        low = df['low']
+        if not self._validate_dataframe(df, ['high', 'low', 'close']):
+            empty = pd.Series([0.0])
+            return empty, empty, pd.Series([0])
         
-        range_val = high - low
+        close = self._get_column_series(df, 'close')
+        high = self._get_column_series(df, 'high')
+        low = self._get_column_series(df, 'low')
+        
+        if len(df) < period:
+            zeros = pd.Series([0.0] * len(df), index=df.index)
+            trend = pd.Series([0] * len(df), index=df.index)
+            return zeros, zeros, trend
+        
+        range_val = (high - low).fillna(0.0)
         smooth_range = range_val.ewm(span=period, adjust=False).mean()
+        smooth_range = smooth_range.fillna(0.0)
         
         range_filter = smooth_range * multiplier
         
         upper_filter = close + range_filter
         lower_filter = close - range_filter
         
-        upper_filter = upper_filter.ewm(span=period, adjust=False).mean()
-        lower_filter = lower_filter.ewm(span=period, adjust=False).mean()
+        upper_filter = upper_filter.ewm(span=period, adjust=False).mean().fillna(close)
+        lower_filter = lower_filter.ewm(span=period, adjust=False).mean().fillna(close)
         
         trend = pd.Series(0, index=df.index)
         for i in range(1, len(df)):
-            if close.iloc[i] > upper_filter.iloc[i-1]:
+            close_val = close.iloc[i] if not pd.isna(close.iloc[i]) else 0.0
+            upper_prev = upper_filter.iloc[i-1] if not pd.isna(upper_filter.iloc[i-1]) else close_val
+            lower_prev = lower_filter.iloc[i-1] if not pd.isna(lower_filter.iloc[i-1]) else close_val
+            
+            if close_val > upper_prev:
                 trend.iloc[i] = 1
-            elif close.iloc[i] < lower_filter.iloc[i-1]:
+            elif close_val < lower_prev:
                 trend.iloc[i] = -1
             else:
-                trend.iloc[i] = trend.iloc[i-1]
+                trend.iloc[i] = trend.iloc[i-1] if i > 0 else 0
         
         return upper_filter, lower_filter, trend
     
@@ -105,26 +328,44 @@ class IndicatorEngine:
                    cerebr_signal: Signal line (smoothed)
                    bias_direction: 1 untuk bullish bias, -1 untuk bearish bias, 0 untuk neutral
         """
-        close = df['close']
-        high = df['high']
-        low = df['low']
+        if not self._validate_dataframe(df, ['high', 'low', 'close']):
+            empty = pd.Series([50.0])
+            return empty, empty, pd.Series([0])
         
-        high_period = high.rolling(window=period).max()
-        low_period = low.rolling(window=period).min()
+        close = self._get_column_series(df, 'close')
+        high = self._get_column_series(df, 'high')
+        low = self._get_column_series(df, 'low')
+        
+        if len(df) < period:
+            default_val = pd.Series([50.0] * len(df), index=df.index)
+            trend = pd.Series([0] * len(df), index=df.index)
+            return default_val, default_val, trend
+        
+        high_period = high.rolling(window=period, min_periods=1).max()
+        low_period = low.rolling(window=period, min_periods=1).min()
+        
+        high_period = high_period.fillna(high)
+        low_period = low_period.fillna(low)
         
         range_period = high_period - low_period
-        range_period = range_period.replace(0, 1)
+        range_period = range_period.replace(0, 1e-10)
+        range_period = range_period.fillna(1e-10)
         
-        cerebr_raw = ((close - low_period) / range_period) * 100
+        cerebr_raw = safe_divide(close - low_period, range_period, fill_value=0.5) * 100
+        cerebr_raw = cerebr_raw.fillna(50.0)
         
         cerebr_value = cerebr_raw.ewm(span=smoothing, adjust=False).mean()
         cerebr_signal = cerebr_value.ewm(span=smoothing, adjust=False).mean()
         
+        cerebr_value = cerebr_value.fillna(50.0)
+        cerebr_signal = cerebr_signal.fillna(50.0)
+        
         bias_direction = pd.Series(0, index=df.index)
         for i in range(len(df)):
-            if cerebr_value.iloc[i] > 60:
+            val = cerebr_value.iloc[i] if not pd.isna(cerebr_value.iloc[i]) else 50.0
+            if val > 60:
                 bias_direction.iloc[i] = 1
-            elif cerebr_value.iloc[i] < 40:
+            elif val < 40:
                 bias_direction.iloc[i] = -1
             else:
                 bias_direction.iloc[i] = 0
@@ -132,68 +373,116 @@ class IndicatorEngine:
         return cerebr_value, cerebr_signal, bias_direction
     
     def calculate_macd(self, df: pd.DataFrame, fast: int = 12, slow: int = 26, signal: int = 9) -> tuple:
-        ema_fast = df['close'].ewm(span=fast, adjust=False).mean()
-        ema_slow = df['close'].ewm(span=slow, adjust=False).mean()
+        """Calculate MACD with null handling."""
+        if not self._validate_dataframe(df, ['close']):
+            empty = pd.Series([0.0])
+            return empty, empty, empty
+        
+        close = self._get_column_series(df, 'close')
+        
+        if len(close) < slow:
+            zeros = pd.Series([0.0] * len(df), index=df.index)
+            return zeros, zeros, zeros
+        
+        ema_fast = close.ewm(span=fast, adjust=False).mean()
+        ema_slow = close.ewm(span=slow, adjust=False).mean()
+        
+        ema_fast = ema_fast.fillna(close)
+        ema_slow = ema_slow.fillna(close)
+        
         macd_line = ema_fast - ema_slow
+        macd_line = macd_line.fillna(0.0)
+        
         macd_signal = macd_line.ewm(span=signal, adjust=False).mean()
+        macd_signal = macd_signal.fillna(0.0)
+        
         macd_histogram = macd_line - macd_signal
+        macd_histogram = macd_histogram.fillna(0.0)
+        
         return macd_line, macd_signal, macd_histogram
     
     def get_indicators(self, df: pd.DataFrame) -> Optional[Dict]:
+        """
+        Calculate all indicators with comprehensive null handling.
+        
+        Args:
+            df: DataFrame with OHLC data
+        
+        Returns:
+            Dictionary of indicator values or None if insufficient data
+        """
+        if not self._validate_dataframe(df, ['open', 'high', 'low', 'close']):
+            return None
+        
         all_periods = self.ema_periods + self.ema_periods_long
         min_required = max(30, max(all_periods + [self.rsi_period, self.stoch_k_period, self.atr_period]) + 10)
+        
         if len(df) < min_required:
             return None
         
         indicators = {}
         
         for period in self.ema_periods:
-            indicators[f'ema_{period}'] = self.calculate_ema(df, period).iloc[-1]
+            ema_series = self.calculate_ema(df, period)
+            indicators[f'ema_{period}'] = safe_series_operation(ema_series, 'value', -1, 0.0)
         
         for period in self.ema_periods_long:
-            indicators[f'ema_{period}'] = self.calculate_ema(df, period).iloc[-1]
+            ema_series = self.calculate_ema(df, period)
+            indicators[f'ema_{period}'] = safe_series_operation(ema_series, 'value', -1, 0.0)
         
         rsi_series = self.calculate_rsi(df, self.rsi_period)
-        indicators['rsi'] = rsi_series.iloc[-1]
-        indicators['rsi_prev'] = rsi_series.iloc[-2]
-        indicators['rsi_history'] = rsi_series.tail(20).tolist()
+        indicators['rsi'] = safe_series_operation(rsi_series, 'value', -1, 50.0)
+        indicators['rsi_prev'] = safe_series_operation(rsi_series, 'value', -2, 50.0)
+        
+        try:
+            rsi_tail = rsi_series.tail(20).fillna(50.0).tolist()
+            indicators['rsi_history'] = [float(v) if not pd.isna(v) else 50.0 for v in rsi_tail]
+        except Exception:
+            indicators['rsi_history'] = [50.0] * 20
         
         stoch_k, stoch_d = self.calculate_stochastic(
             df, self.stoch_k_period, self.stoch_d_period, self.stoch_smooth_k
         )
-        indicators['stoch_k'] = stoch_k.iloc[-1]
-        indicators['stoch_d'] = stoch_d.iloc[-1]
-        indicators['stoch_k_prev'] = stoch_k.iloc[-2]
-        indicators['stoch_d_prev'] = stoch_d.iloc[-2]
+        indicators['stoch_k'] = safe_series_operation(stoch_k, 'value', -1, 50.0)
+        indicators['stoch_d'] = safe_series_operation(stoch_d, 'value', -1, 50.0)
+        indicators['stoch_k_prev'] = safe_series_operation(stoch_k, 'value', -2, 50.0)
+        indicators['stoch_d_prev'] = safe_series_operation(stoch_d, 'value', -2, 50.0)
         
-        indicators['atr'] = self.calculate_atr(df, self.atr_period).iloc[-1]
+        atr_series = self.calculate_atr(df, self.atr_period)
+        indicators['atr'] = safe_series_operation(atr_series, 'value', -1, 0.0)
         
         macd_line, macd_signal, macd_histogram = self.calculate_macd(
             df, self.macd_fast, self.macd_slow, self.macd_signal
         )
-        indicators['macd'] = macd_line.iloc[-1]
-        indicators['macd_signal'] = macd_signal.iloc[-1]
-        indicators['macd_histogram'] = macd_histogram.iloc[-1]
-        indicators['macd_prev'] = macd_line.iloc[-2]
-        indicators['macd_signal_prev'] = macd_signal.iloc[-2]
+        indicators['macd'] = safe_series_operation(macd_line, 'value', -1, 0.0)
+        indicators['macd_signal'] = safe_series_operation(macd_signal, 'value', -1, 0.0)
+        indicators['macd_histogram'] = safe_series_operation(macd_histogram, 'value', -1, 0.0)
+        indicators['macd_prev'] = safe_series_operation(macd_line, 'value', -2, 0.0)
+        indicators['macd_signal_prev'] = safe_series_operation(macd_signal, 'value', -2, 0.0)
         
-        indicators['volume'] = df['volume'].iloc[-1]
-        indicators['volume_avg'] = self.calculate_volume_average(df).iloc[-1]
+        volume_series = self._get_column_series(df, 'volume')
+        indicators['volume'] = safe_series_operation(volume_series, 'value', -1, 0.0)
+        vol_avg_series = self.calculate_volume_average(df)
+        indicators['volume_avg'] = safe_series_operation(vol_avg_series, 'value', -1, 0.0)
         
         trf_upper, trf_lower, trf_trend = self.calculate_twin_range_filter(df, period=27, multiplier=2.0)
-        indicators['trf_upper'] = trf_upper.iloc[-1]
-        indicators['trf_lower'] = trf_lower.iloc[-1]
-        indicators['trf_trend'] = trf_trend.iloc[-1]
-        indicators['trf_trend_prev'] = trf_trend.iloc[-2] if len(trf_trend) > 1 else 0
+        indicators['trf_upper'] = safe_series_operation(trf_upper, 'value', -1, 0.0)
+        indicators['trf_lower'] = safe_series_operation(trf_lower, 'value', -1, 0.0)
+        indicators['trf_trend'] = safe_series_operation(trf_trend, 'value', -1, 0)
+        indicators['trf_trend_prev'] = safe_series_operation(trf_trend, 'value', -2, 0)
         
         cerebr_value, cerebr_signal, cerebr_bias = self.calculate_market_bias_cerebr(df, period=60, smoothing=10)
-        indicators['cerebr_value'] = cerebr_value.iloc[-1]
-        indicators['cerebr_signal'] = cerebr_signal.iloc[-1]
-        indicators['cerebr_bias'] = cerebr_bias.iloc[-1]
-        indicators['cerebr_bias_prev'] = cerebr_bias.iloc[-2] if len(cerebr_bias) > 1 else 0
+        indicators['cerebr_value'] = safe_series_operation(cerebr_value, 'value', -1, 50.0)
+        indicators['cerebr_signal'] = safe_series_operation(cerebr_signal, 'value', -1, 50.0)
+        indicators['cerebr_bias'] = safe_series_operation(cerebr_bias, 'value', -1, 0)
+        indicators['cerebr_bias_prev'] = safe_series_operation(cerebr_bias, 'value', -2, 0)
         
-        indicators['close'] = df['close'].iloc[-1]
-        indicators['high'] = df['high'].iloc[-1]
-        indicators['low'] = df['low'].iloc[-1]
+        close_series = self._get_column_series(df, 'close')
+        high_series = self._get_column_series(df, 'high')
+        low_series = self._get_column_series(df, 'low')
+        
+        indicators['close'] = safe_series_operation(close_series, 'value', -1, 0.0)
+        indicators['high'] = safe_series_operation(high_series, 'value', -1, 0.0)
+        indicators['low'] = safe_series_operation(low_series, 'value', -1, 0.0)
         
         return indicators

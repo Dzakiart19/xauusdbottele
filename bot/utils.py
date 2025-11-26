@@ -3,14 +3,334 @@ import json
 import hashlib
 import time
 import math
+import threading
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Callable
-from functools import wraps
+from typing import Any, Dict, List, Optional, Callable, TypeVar, Generic
+from functools import wraps, lru_cache
 from collections import OrderedDict
+from dataclasses import dataclass, field
 import pytz
 from bot.logger import setup_logger
 
 logger = setup_logger('Utils')
+
+T = TypeVar('T')
+
+
+class RecursionLimitExceeded(Exception):
+    """Raised when recursion depth limit is exceeded"""
+    pass
+
+
+@dataclass
+class RecursionStats:
+    """Statistics for recursion tracking"""
+    max_depth_reached: int = 0
+    total_calls: int = 0
+    limit_exceeded_count: int = 0
+
+
+class RecursionGuard:
+    """Helper class to enforce max depth counters for recursive helpers
+    
+    Usage:
+        guard = RecursionGuard(max_depth=100, name="tree_traversal")
+        
+        def traverse(node, guard=guard):
+            with guard:
+                if node.children:
+                    for child in node.children:
+                        traverse(child, guard)
+    """
+    
+    _thread_local = threading.local()
+    
+    def __init__(self, max_depth: int = 100, name: str = "unnamed", 
+                 raise_on_limit: bool = True, log_warnings: bool = True):
+        """Initialize recursion guard
+        
+        Args:
+            max_depth: Maximum allowed recursion depth
+            name: Name for logging identification
+            raise_on_limit: Whether to raise exception when limit exceeded
+            log_warnings: Whether to log warnings when approaching limit
+        """
+        self.max_depth = max_depth
+        self.name = name
+        self.raise_on_limit = raise_on_limit
+        self.log_warnings = log_warnings
+        self._stats = RecursionStats()
+        self._warning_threshold = int(max_depth * 0.8)
+    
+    def _get_depth(self) -> int:
+        """Get current depth for this thread"""
+        key = f"_recursion_depth_{self.name}"
+        return getattr(self._thread_local, key, 0)
+    
+    def _set_depth(self, depth: int):
+        """Set current depth for this thread"""
+        key = f"_recursion_depth_{self.name}"
+        setattr(self._thread_local, key, depth)
+    
+    def __enter__(self):
+        """Enter recursion level"""
+        current_depth = self._get_depth()
+        new_depth = current_depth + 1
+        self._set_depth(new_depth)
+        
+        self._stats.total_calls += 1
+        if new_depth > self._stats.max_depth_reached:
+            self._stats.max_depth_reached = new_depth
+        
+        if self.log_warnings and new_depth == self._warning_threshold:
+            logger.warning(
+                f"RecursionGuard[{self.name}]: Approaching limit - "
+                f"depth {new_depth}/{self.max_depth} (80% threshold)"
+            )
+        
+        if new_depth > self.max_depth:
+            self._stats.limit_exceeded_count += 1
+            logger.error(
+                f"RecursionGuard[{self.name}]: Max depth {self.max_depth} exceeded "
+                f"(current: {new_depth}, exceeded {self._stats.limit_exceeded_count} times)"
+            )
+            if self.raise_on_limit:
+                raise RecursionLimitExceeded(
+                    f"Recursion limit exceeded in {self.name}: {new_depth} > {self.max_depth}"
+                )
+        
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Exit recursion level"""
+        current_depth = self._get_depth()
+        self._set_depth(max(0, current_depth - 1))
+        return False
+    
+    def reset(self):
+        """Reset depth counter (useful for testing)"""
+        self._set_depth(0)
+    
+    def get_current_depth(self) -> int:
+        """Get current recursion depth"""
+        return self._get_depth()
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get recursion statistics"""
+        return {
+            'name': self.name,
+            'max_depth': self.max_depth,
+            'current_depth': self._get_depth(),
+            'max_depth_reached': self._stats.max_depth_reached,
+            'total_calls': self._stats.total_calls,
+            'limit_exceeded_count': self._stats.limit_exceeded_count
+        }
+    
+    def check_depth(self) -> bool:
+        """Check if current depth is within limits (non-context manager usage)"""
+        return self._get_depth() < self.max_depth
+
+
+def with_recursion_guard(max_depth: int = 100, name: Optional[str] = None):
+    """Decorator to add recursion guard to a function
+    
+    Args:
+        max_depth: Maximum recursion depth
+        name: Optional name for the guard (defaults to function name)
+    """
+    def decorator(func: Callable) -> Callable:
+        guard_name = name or func.__name__
+        guard = RecursionGuard(max_depth=max_depth, name=guard_name)
+        
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            with guard:
+                return func(*args, **kwargs)
+        
+        wrapper._recursion_guard = guard
+        return wrapper
+    
+    return decorator
+
+
+@dataclass
+class CacheMetrics:
+    """Metrics for LRU cache performance"""
+    hits: int = 0
+    misses: int = 0
+    evictions: int = 0
+    total_accesses: int = 0
+    created_at: datetime = field(default_factory=datetime.now)
+    last_eviction_at: Optional[datetime] = None
+    
+    @property
+    def hit_rate(self) -> float:
+        if self.total_accesses == 0:
+            return 0.0
+        return self.hits / self.total_accesses
+    
+    @property
+    def eviction_rate(self) -> float:
+        if self.total_accesses == 0:
+            return 0.0
+        return self.evictions / self.total_accesses
+
+
+class TunedLRUCache(Generic[T]):
+    """LRU Cache with size/time metrics and eviction logging
+    
+    Provides enhanced monitoring and tuning capabilities over standard LRU cache.
+    """
+    
+    DEFAULT_MAX_SIZE = 128
+    DEFAULT_TTL = 300
+    
+    def __init__(self, max_size: int = DEFAULT_MAX_SIZE, ttl_seconds: int = DEFAULT_TTL,
+                 name: str = "unnamed", log_evictions: bool = True):
+        """Initialize tuned LRU cache
+        
+        Args:
+            max_size: Maximum number of items to cache
+            ttl_seconds: Time-to-live for cached items in seconds
+            name: Name for logging identification
+            log_evictions: Whether to log eviction events
+        """
+        self.max_size = max_size
+        self.ttl = ttl_seconds
+        self.name = name
+        self.log_evictions = log_evictions
+        
+        self._cache: OrderedDict = OrderedDict()
+        self._timestamps: Dict[str, datetime] = {}
+        self._metrics = CacheMetrics()
+        self._lock = threading.RLock()
+    
+    def get(self, key: str) -> Optional[T]:
+        """Get item from cache"""
+        with self._lock:
+            self._metrics.total_accesses += 1
+            
+            if key not in self._cache:
+                self._metrics.misses += 1
+                return None
+            
+            timestamp = self._timestamps.get(key)
+            if timestamp and (datetime.now() - timestamp).total_seconds() > self.ttl:
+                self._evict(key, reason="TTL expired")
+                self._metrics.misses += 1
+                return None
+            
+            self._cache.move_to_end(key)
+            self._metrics.hits += 1
+            return self._cache[key]
+    
+    def set(self, key: str, value: T):
+        """Set item in cache"""
+        with self._lock:
+            if key in self._cache:
+                self._cache.move_to_end(key)
+                self._cache[key] = value
+                self._timestamps[key] = datetime.now()
+                return
+            
+            while len(self._cache) >= self.max_size:
+                oldest_key = next(iter(self._cache))
+                self._evict(oldest_key, reason="LRU eviction (capacity)")
+            
+            self._cache[key] = value
+            self._timestamps[key] = datetime.now()
+    
+    def _evict(self, key: str, reason: str = ""):
+        """Evict item from cache with logging"""
+        if key in self._cache:
+            del self._cache[key]
+        if key in self._timestamps:
+            del self._timestamps[key]
+        
+        self._metrics.evictions += 1
+        self._metrics.last_eviction_at = datetime.now()
+        
+        if self.log_evictions:
+            logger.debug(
+                f"LRUCache[{self.name}]: Evicted key '{key}' - {reason} "
+                f"(total evictions: {self._metrics.evictions})"
+            )
+    
+    def cleanup_expired(self) -> int:
+        """Remove all expired entries"""
+        with self._lock:
+            now = datetime.now()
+            expired_keys = [
+                key for key, timestamp in self._timestamps.items()
+                if (now - timestamp).total_seconds() > self.ttl
+            ]
+            
+            for key in expired_keys:
+                self._evict(key, reason="TTL cleanup")
+            
+            if expired_keys and self.log_evictions:
+                logger.info(
+                    f"LRUCache[{self.name}]: Cleaned up {len(expired_keys)} expired entries"
+                )
+            
+            return len(expired_keys)
+    
+    def clear(self):
+        """Clear all cache entries"""
+        with self._lock:
+            count = len(self._cache)
+            self._cache.clear()
+            self._timestamps.clear()
+            if count > 0 and self.log_evictions:
+                logger.info(f"LRUCache[{self.name}]: Cleared {count} entries")
+    
+    def delete(self, key: str) -> bool:
+        """Delete a specific key"""
+        with self._lock:
+            if key in self._cache:
+                self._evict(key, reason="manual delete")
+                return True
+            return False
+    
+    def size(self) -> int:
+        """Get current cache size"""
+        return len(self._cache)
+    
+    def get_metrics(self) -> Dict[str, Any]:
+        """Get cache performance metrics"""
+        with self._lock:
+            age_seconds = (datetime.now() - self._metrics.created_at).total_seconds()
+            return {
+                'name': self.name,
+                'size': len(self._cache),
+                'max_size': self.max_size,
+                'ttl_seconds': self.ttl,
+                'hits': self._metrics.hits,
+                'misses': self._metrics.misses,
+                'evictions': self._metrics.evictions,
+                'hit_rate': f"{self._metrics.hit_rate:.2%}",
+                'eviction_rate': f"{self._metrics.eviction_rate:.2%}",
+                'age_seconds': int(age_seconds),
+                'last_eviction': (
+                    self._metrics.last_eviction_at.isoformat()
+                    if self._metrics.last_eviction_at else None
+                )
+            }
+    
+    def tune_size(self, new_max_size: int):
+        """Dynamically tune cache size based on metrics"""
+        with self._lock:
+            old_size = self.max_size
+            self.max_size = new_max_size
+            
+            while len(self._cache) > self.max_size:
+                oldest_key = next(iter(self._cache))
+                self._evict(oldest_key, reason=f"resize from {old_size} to {new_max_size}")
+            
+            logger.info(
+                f"LRUCache[{self.name}]: Resized from {old_size} to {new_max_size} "
+                f"(current: {len(self._cache)} items)"
+            )
 
 def retry(max_retries: int = 3, backoff_factor: float = 2.0, exceptions: tuple = (Exception,)):
     """

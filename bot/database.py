@@ -1,14 +1,15 @@
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Boolean, Text, text, BigInteger
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Boolean, Text, text, BigInteger, event
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, scoped_session
 from sqlalchemy.exc import SQLAlchemyError, OperationalError, IntegrityError
 from sqlalchemy.exc import DatabaseError as SQLAlchemyDatabaseError
+from sqlalchemy.pool import QueuePool
 from contextlib import contextmanager
 from datetime import datetime
 import os
 import time
 import threading
-from typing import Callable, Any, Optional, Generator
+from typing import Callable, Any, Optional, Generator, Dict
 from functools import wraps
 import logging
 
@@ -18,12 +19,22 @@ Base = declarative_base()
 
 _transaction_lock = threading.Lock()
 
+POOL_SIZE = 5
+MAX_OVERFLOW = 10
+POOL_TIMEOUT = 30
+POOL_RECYCLE = 3600
+POOL_PRE_PING = True
+
 class DatabaseError(Exception):
     """Base exception for database errors"""
     pass
 
 class RetryableError(DatabaseError):
     """Database error that can be retried"""
+    pass
+
+class ConnectionPoolExhausted(DatabaseError):
+    """Connection pool exhausted error"""
     pass
 
 def retry_on_db_error(max_retries: int = 3, initial_delay: float = 0.1):
@@ -68,7 +79,7 @@ class Trade(Base):
     __tablename__ = 'trades'
     
     id = Column(Integer, primary_key=True)
-    user_id = Column(BigInteger, nullable=False)  # BigInteger for Telegram IDs (can exceed 32-bit)
+    user_id = Column(BigInteger, nullable=False)
     ticker = Column(String(20), nullable=False)
     signal_type = Column(String(10), nullable=False)
     signal_source = Column(String(10), default='auto')
@@ -90,7 +101,7 @@ class SignalLog(Base):
     __tablename__ = 'signal_logs'
     
     id = Column(Integer, primary_key=True)
-    user_id = Column(BigInteger, nullable=False)  # BigInteger for Telegram IDs (can exceed 32-bit)
+    user_id = Column(BigInteger, nullable=False)
     ticker = Column(String(20), nullable=False)
     signal_type = Column(String(10), nullable=False)
     signal_source = Column(String(10), default='auto')
@@ -105,7 +116,7 @@ class Position(Base):
     __tablename__ = 'positions'
     
     id = Column(Integer, primary_key=True)
-    user_id = Column(BigInteger, nullable=False)  # BigInteger for Telegram IDs (can exceed 32-bit)
+    user_id = Column(BigInteger, nullable=False)
     trade_id = Column(Integer, nullable=False)
     ticker = Column(String(20), nullable=False)
     signal_type = Column(String(10), nullable=False)
@@ -148,6 +159,18 @@ class CandleData(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 class DatabaseManager:
+    """Database manager with connection pooling and rollback safety.
+    
+    Connection Pooling:
+    - Uses SQLAlchemy QueuePool with configurable pool_size and max_overflow
+    - pool_pre_ping ensures connections are valid before use
+    - Pool monitoring via get_pool_status()
+    
+    Rollback Safety:
+    - Per-operation rollback guarantees via try/except/finally
+    - Safe session closure in finally blocks
+    - transaction_scope() context manager for atomic operations
+    """
     def __init__(self, db_path='data/bot.db', database_url=''):
         """Initialize database with PostgreSQL or SQLite support
         
@@ -158,6 +181,14 @@ class DatabaseManager:
         self.is_postgres = False
         self.engine = None
         self.Session = None
+        self._pool_stats = {
+            'checkouts': 0,
+            'checkins': 0,
+            'connects': 0,
+            'disconnects': 0,
+            'overflow_connections': 0
+        }
+        self._pool_stats_lock = threading.Lock()
         
         try:
             if database_url and database_url.strip():
@@ -167,11 +198,12 @@ class DatabaseManager:
                 
                 engine_kwargs = {
                     'echo': False,
-                    'pool_pre_ping': True,
-                    'pool_recycle': 3600,
-                    'pool_size': 5,
-                    'max_overflow': 10,
-                    'pool_timeout': 30
+                    'pool_pre_ping': POOL_PRE_PING,
+                    'pool_recycle': POOL_RECYCLE,
+                    'pool_size': POOL_SIZE,
+                    'max_overflow': MAX_OVERFLOW,
+                    'pool_timeout': POOL_TIMEOUT,
+                    'poolclass': QueuePool
                 }
                 
                 if not self.is_postgres:
@@ -182,6 +214,7 @@ class DatabaseManager:
                 
                 self.engine = create_engine(db_url, **engine_kwargs)
                 logger.info(f"✅ Database engine created: {'PostgreSQL' if self.is_postgres else 'SQLite (from URL)'}")
+                logger.info(f"   Pool config: size={POOL_SIZE}, max_overflow={MAX_OVERFLOW}, timeout={POOL_TIMEOUT}s")
                 
             else:
                 if not db_path or not isinstance(db_path, str):
@@ -200,9 +233,11 @@ class DatabaseManager:
                         'timeout': 30.0
                     },
                     echo=False,
-                    pool_pre_ping=True,
-                    pool_recycle=3600
+                    pool_pre_ping=POOL_PRE_PING,
+                    pool_recycle=POOL_RECYCLE
                 )
+            
+            self._setup_pool_event_listeners()
             
             self._configure_database()
             
@@ -232,6 +267,74 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"Unexpected error during database initialization: {type(e).__name__}: {e}")
             raise DatabaseError(f"Database initialization failed: {e}")
+    
+    def _setup_pool_event_listeners(self):
+        """Setup event listeners for connection pool monitoring."""
+        @event.listens_for(self.engine, 'checkout')
+        def on_checkout(dbapi_conn, connection_record, connection_proxy):
+            with self._pool_stats_lock:
+                self._pool_stats['checkouts'] += 1
+        
+        @event.listens_for(self.engine, 'checkin')
+        def on_checkin(dbapi_conn, connection_record):
+            with self._pool_stats_lock:
+                self._pool_stats['checkins'] += 1
+        
+        @event.listens_for(self.engine, 'connect')
+        def on_connect(dbapi_conn, connection_record):
+            with self._pool_stats_lock:
+                self._pool_stats['connects'] += 1
+        
+        @event.listens_for(self.engine, 'close')
+        def on_close(dbapi_conn, connection_record):
+            with self._pool_stats_lock:
+                self._pool_stats['disconnects'] += 1
+        
+        logger.debug("Pool event listeners configured")
+    
+    def get_pool_status(self) -> Dict:
+        """Get current connection pool status.
+        
+        Returns:
+            Dict with pool statistics and current state
+        """
+        pool = self.engine.pool
+        
+        with self._pool_stats_lock:
+            stats = self._pool_stats.copy()
+        
+        status = {
+            'pool_size': pool.size() if hasattr(pool, 'size') else POOL_SIZE,
+            'checked_in': pool.checkedin() if hasattr(pool, 'checkedin') else 'N/A',
+            'checked_out': pool.checkedout() if hasattr(pool, 'checkedout') else 'N/A',
+            'overflow': pool.overflow() if hasattr(pool, 'overflow') else 'N/A',
+            'max_overflow': MAX_OVERFLOW,
+            'pool_timeout': POOL_TIMEOUT,
+            'total_checkouts': stats['checkouts'],
+            'total_checkins': stats['checkins'],
+            'total_connects': stats['connects'],
+            'total_disconnects': stats['disconnects'],
+            'is_postgres': self.is_postgres
+        }
+        
+        active = stats['checkouts'] - stats['checkins']
+        status['estimated_active_connections'] = max(0, active)
+        
+        if hasattr(pool, 'checkedout') and hasattr(pool, 'size'):
+            utilization = pool.checkedout() / (pool.size() + MAX_OVERFLOW) * 100 if pool.size() > 0 else 0
+            status['pool_utilization_percent'] = round(utilization, 1)
+        
+        return status
+    
+    def log_pool_status(self):
+        """Log current pool status for monitoring."""
+        status = self.get_pool_status()
+        logger.info(
+            f"Pool Status: checked_in={status['checked_in']}, "
+            f"checked_out={status['checked_out']}, "
+            f"overflow={status['overflow']}, "
+            f"utilization={status.get('pool_utilization_percent', 'N/A')}%"
+        )
     
     def _configure_database(self):
         """Configure database with proper settings (SQLite only)"""
@@ -323,7 +426,6 @@ class DatabaseManager:
                 conn.commit()
                 logger.info("✅ Added user_id column (BIGINT) to trades table")
             else:
-                # Migrate existing INTEGER user_id to BIGINT if needed
                 try:
                     if self.is_postgres:
                         conn.execute(text("""
@@ -331,7 +433,6 @@ class DatabaseManager:
                             ALTER COLUMN user_id TYPE BIGINT
                         """))
                     else:
-                        # SQLite: Create new column and copy data
                         result = conn.execute(text("PRAGMA table_info(trades)"))
                         columns = {row[1]: row[2] for row in result}
                         if 'user_id' in columns and columns['user_id'] != 'BIGINT':
@@ -372,7 +473,6 @@ class DatabaseManager:
                 conn.commit()
                 logger.info("✅ Added user_id column (BIGINT) to signal_logs table")
             else:
-                # Migrate existing INTEGER user_id to BIGINT if needed
                 try:
                     if self.is_postgres:
                         conn.execute(text("""
@@ -406,7 +506,6 @@ class DatabaseManager:
                 conn.commit()
                 logger.info("✅ Added user_id column (BIGINT) to positions table")
             else:
-                # Migrate existing INTEGER user_id to BIGINT if needed
                 try:
                     if self.is_postgres:
                         conn.execute(text("""
@@ -456,12 +555,72 @@ class DatabaseManager:
     
     @retry_on_db_error(max_retries=2, initial_delay=0.05)
     def get_session(self):
-        """Get database session with retry logic"""
+        """Get database session with retry logic and pool monitoring.
+        
+        Returns:
+            Session object for database operations
+            
+        Raises:
+            DatabaseError: If session creation fails after retries
+        """
         try:
-            return self.Session()
+            session = self.Session()
+            return session
         except Exception as e:
             logger.error(f"Error creating database session: {e}")
+            self.log_pool_status()
             raise DatabaseError(f"Failed to create session: {e}")
+    
+    @contextmanager
+    def safe_session(self) -> Generator:
+        """Context manager for safe session handling with guaranteed rollback and closure.
+        
+        Provides per-operation rollback guarantees via try/except and safe session
+        closure in finally blocks.
+        
+        Usage:
+            with db.safe_session() as session:
+                # do database operations
+                session.add(...)
+                # auto-commit on success, auto-rollback on failure
+        """
+        session = self.get_session()
+        try:
+            yield session
+            session.commit()
+        except IntegrityError as e:
+            try:
+                session.rollback()
+            except Exception as rollback_error:
+                logger.error(f"Error during rollback after IntegrityError: {rollback_error}")
+            logger.error(f"Integrity error in safe_session: {e}")
+            raise
+        except OperationalError as e:
+            try:
+                session.rollback()
+            except Exception as rollback_error:
+                logger.error(f"Error during rollback after OperationalError: {rollback_error}")
+            logger.error(f"Operational error in safe_session: {e}")
+            raise
+        except SQLAlchemyError as e:
+            try:
+                session.rollback()
+            except Exception as rollback_error:
+                logger.error(f"Error during rollback after SQLAlchemyError: {rollback_error}")
+            logger.error(f"SQLAlchemy error in safe_session: {e}")
+            raise
+        except Exception as e:
+            try:
+                session.rollback()
+            except Exception as rollback_error:
+                logger.error(f"Error during rollback: {rollback_error}")
+            logger.error(f"Unexpected error in safe_session: {type(e).__name__}: {e}")
+            raise
+        finally:
+            try:
+                session.close()
+            except Exception as close_error:
+                logger.error(f"Error closing session: {close_error}")
     
     @contextmanager
     def transaction_scope(self, isolation_level: Optional[str] = None) -> Generator:
@@ -638,9 +797,10 @@ class DatabaseManager:
             raise
     
     def close(self):
-        """Close database connections with error handling"""
+        """Close database connections with error handling and pool cleanup."""
         try:
             logger.info("Closing database connections...")
+            self.log_pool_status()
             self.Session.remove()
             self.engine.dispose()
             logger.info("✅ Database connections closed successfully")

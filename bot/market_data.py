@@ -1,32 +1,98 @@
 import asyncio
 import websockets
 import json
+import math
+import time
 from datetime import datetime, timedelta
 from collections import deque
+from enum import Enum
 import pandas as pd
 import pytz
 import random
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, List, Tuple, Any
 from bot.logger import setup_logger
 from bot.resilience import CircuitBreaker
 
 logger = setup_logger('MarketData')
 
+
+class ConnectionState(Enum):
+    """WebSocket connection state machine states"""
+    DISCONNECTED = "DISCONNECTED"
+    CONNECTING = "CONNECTING"
+    CONNECTED = "CONNECTED"
+    RECONNECTING = "RECONNECTING"
+
+
 class MarketDataError(Exception):
     """Base exception for market data errors"""
     pass
+
 
 class WebSocketConnectionError(MarketDataError):
     """WebSocket connection error"""
     pass
 
+
 class DataValidationError(MarketDataError):
     """Data validation error"""
     pass
 
+
 class TimeoutError(MarketDataError):
     """Operation timeout error"""
     pass
+
+
+def is_valid_price(price: Any) -> bool:
+    """Check if price is a valid numeric value (not None, not NaN, positive)
+    
+    Args:
+        price: Value to check
+        
+    Returns:
+        True if price is valid, False otherwise
+    """
+    if price is None:
+        return False
+    
+    if not isinstance(price, (int, float)):
+        return False
+    
+    if math.isnan(price) or math.isinf(price):
+        return False
+    
+    if price <= 0:
+        return False
+    
+    return True
+
+
+def sanitize_price_data(data: Dict) -> Tuple[bool, Dict, Optional[str]]:
+    """Sanitize price data dictionary, removing or flagging NaN values
+    
+    Args:
+        data: Dictionary containing price data
+        
+    Returns:
+        Tuple of (is_valid, sanitized_data, error_message)
+    """
+    if not isinstance(data, dict):
+        return False, {}, "Data is not a dictionary"
+    
+    sanitized = {}
+    price_fields = ['bid', 'ask', 'quote', 'open', 'high', 'low', 'close']
+    
+    for key, value in data.items():
+        if key in price_fields:
+            if not is_valid_price(value):
+                return False, {}, f"Invalid price value for {key}: {value}"
+            sanitized[key] = float(value)
+        else:
+            sanitized[key] = value
+    
+    return True, sanitized, None
+
 
 class OHLCBuilder:
     def __init__(self, timeframe_minutes: int = 1):
@@ -38,16 +104,54 @@ class OHLCBuilder:
         self.current_candle = None
         self.candles = deque(maxlen=500)
         self.tick_count = 0
+        self.nan_scrub_count = 0
         logger.debug(f"OHLCBuilder initialized for M{timeframe_minutes}")
+    
+    def _scrub_nan_prices(self, prices: Dict) -> Tuple[bool, Dict]:
+        """Scrub NaN values from price dictionary at builder boundary
+        
+        Args:
+            prices: Dictionary with open, high, low, close values
+            
+        Returns:
+            Tuple of (is_valid, scrubbed_prices)
+        """
+        scrubbed = {}
+        for key in ['open', 'high', 'low', 'close', 'volume']:
+            value = prices.get(key)
+            if value is None:
+                if key == 'volume':
+                    scrubbed[key] = 0
+                else:
+                    return False, {}
+            elif isinstance(value, (int, float)):
+                if math.isnan(value) or math.isinf(value):
+                    self.nan_scrub_count += 1
+                    logger.warning(f"NaN/Inf scrubbed from {key} in M{self.timeframe_minutes} builder (total scrubs: {self.nan_scrub_count})")
+                    return False, {}
+                scrubbed[key] = float(value)
+            else:
+                return False, {}
+        
+        if 'timestamp' in prices:
+            scrubbed['timestamp'] = prices['timestamp']
+        
+        return True, scrubbed
         
     def _validate_tick_data(self, bid: float, ask: float, timestamp: datetime) -> Tuple[bool, Optional[str]]:
-        """Validate tick data before processing"""
+        """Validate tick data before processing with NaN check"""
         try:
             if bid is None or ask is None:
                 return False, "Bid or Ask is None"
             
             if not isinstance(bid, (int, float)) or not isinstance(ask, (int, float)):
                 return False, f"Invalid bid/ask type: bid={type(bid)}, ask={type(ask)}"
+            
+            if math.isnan(bid) or math.isnan(ask):
+                return False, f"NaN detected in bid/ask: bid={bid}, ask={ask}"
+            
+            if math.isinf(bid) or math.isinf(ask):
+                return False, f"Inf detected in bid/ask: bid={bid}, ask={ask}"
             
             if bid <= 0 or ask <= 0:
                 return False, f"Invalid bid/ask values: bid={bid}, ask={ask}"
@@ -71,7 +175,7 @@ class OHLCBuilder:
             return False, f"Validation error: {str(e)}"
         
     def add_tick(self, bid: float, ask: float, timestamp: datetime):
-        """Add tick data with validation and error handling"""
+        """Add tick data with validation, NaN scrubbing, and error handling"""
         try:
             is_valid, error_msg = self._validate_tick_data(bid, ask, timestamp)
             if not is_valid:
@@ -79,6 +183,10 @@ class OHLCBuilder:
                 return
             
             mid_price = (bid + ask) / 2.0
+            
+            if math.isnan(mid_price) or math.isinf(mid_price):
+                logger.warning(f"NaN/Inf mid_price calculated from bid={bid}, ask={ask}")
+                return
             
             if timestamp.tzinfo is None:
                 timestamp = timestamp.replace(tzinfo=pytz.UTC)
@@ -91,8 +199,12 @@ class OHLCBuilder:
             
             if self.current_candle is None or self.current_candle['timestamp'] != candle_start:
                 if self.current_candle is not None:
-                    self.candles.append(self.current_candle.copy())
-                    logger.debug(f"M{self.timeframe_minutes} candle completed: O={self.current_candle['open']:.2f} H={self.current_candle['high']:.2f} L={self.current_candle['low']:.2f} C={self.current_candle['close']:.2f} V={self.current_candle['volume']}")
+                    is_valid_candle, scrubbed_candle = self._scrub_nan_prices(self.current_candle)
+                    if is_valid_candle:
+                        self.candles.append(scrubbed_candle.copy())
+                        logger.debug(f"M{self.timeframe_minutes} candle completed: O={scrubbed_candle['open']:.2f} H={scrubbed_candle['high']:.2f} L={scrubbed_candle['low']:.2f} C={scrubbed_candle['close']:.2f} V={scrubbed_candle['volume']}")
+                    else:
+                        logger.warning(f"Discarding invalid M{self.timeframe_minutes} candle due to NaN values")
                 
                 self.current_candle = {
                     'timestamp': candle_start,
@@ -115,18 +227,25 @@ class OHLCBuilder:
             logger.debug(f"Tick data: bid={bid}, ask={ask}, timestamp={timestamp}")
         
     def get_dataframe(self, limit: int = 100) -> Optional[pd.DataFrame]:
-        """Get DataFrame with validation and error handling"""
+        """Get DataFrame with validation, NaN filtering, and error handling"""
         try:
             if limit <= 0:
                 logger.warning(f"Invalid limit: {limit}. Using default 100")
                 limit = 100
             
-            all_candles = list(self.candles)
+            all_candles = []
+            for candle in self.candles:
+                is_valid, scrubbed = self._scrub_nan_prices(candle)
+                if is_valid:
+                    all_candles.append(scrubbed)
+            
             if self.current_candle:
-                all_candles.append(self.current_candle)
+                is_valid, scrubbed = self._scrub_nan_prices(self.current_candle)
+                if is_valid:
+                    all_candles.append(scrubbed)
             
             if len(all_candles) == 0:
-                logger.debug(f"No candles available for M{self.timeframe_minutes}")
+                logger.debug(f"No valid candles available for M{self.timeframe_minutes}")
                 return None
             
             df = pd.DataFrame(all_candles)
@@ -135,6 +254,14 @@ class OHLCBuilder:
             if not all(col in df.columns for col in required_columns):
                 logger.error(f"Missing required columns in candle data. Have: {df.columns.tolist()}")
                 return None
+            
+            for col in ['open', 'high', 'low', 'close', 'volume']:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+            
+            nan_rows = df[['open', 'high', 'low', 'close']].isna().any(axis=1).sum()
+            if nan_rows > 0:
+                logger.warning(f"Dropping {nan_rows} rows with NaN values from M{self.timeframe_minutes} DataFrame")
+                df = df.dropna(subset=['open', 'high', 'low', 'close'])
             
             df['timestamp'] = pd.to_datetime(df['timestamp'])
             df.set_index('timestamp', inplace=True)
@@ -155,6 +282,83 @@ class OHLCBuilder:
         self.current_candle = None
         self.tick_count = 0
         logger.debug(f"OHLCBuilder M{self.timeframe_minutes} cleared")
+    
+    def get_stats(self) -> Dict:
+        """Get builder statistics including NaN scrub count"""
+        return {
+            'timeframe': f"M{self.timeframe_minutes}",
+            'candle_count': len(self.candles),
+            'has_current_candle': self.current_candle is not None,
+            'tick_count': self.tick_count,
+            'nan_scrub_count': self.nan_scrub_count
+        }
+
+
+class ConnectionMetrics:
+    """Track WebSocket connection metrics for monitoring"""
+    
+    def __init__(self):
+        self.total_connections = 0
+        self.total_disconnections = 0
+        self.total_reconnect_attempts = 0
+        self.successful_reconnects = 0
+        self.failed_reconnects = 0
+        self.last_connected_at: Optional[datetime] = None
+        self.last_disconnected_at: Optional[datetime] = None
+        self.connection_durations: deque = deque(maxlen=100)
+        self.state_transitions: deque = deque(maxlen=50)
+    
+    def record_connection(self):
+        """Record a successful connection"""
+        self.total_connections += 1
+        self.last_connected_at = datetime.now(pytz.UTC)
+        self._add_transition(ConnectionState.CONNECTED)
+    
+    def record_disconnection(self):
+        """Record a disconnection"""
+        self.total_disconnections += 1
+        now = datetime.now(pytz.UTC)
+        self.last_disconnected_at = now
+        
+        if self.last_connected_at:
+            duration = (now - self.last_connected_at).total_seconds()
+            self.connection_durations.append(duration)
+        
+        self._add_transition(ConnectionState.DISCONNECTED)
+    
+    def record_reconnect_attempt(self, success: bool):
+        """Record a reconnection attempt"""
+        self.total_reconnect_attempts += 1
+        if success:
+            self.successful_reconnects += 1
+        else:
+            self.failed_reconnects += 1
+    
+    def _add_transition(self, state: ConnectionState):
+        """Add state transition record"""
+        self.state_transitions.append({
+            'state': state.value,
+            'timestamp': datetime.now(pytz.UTC).isoformat()
+        })
+    
+    def get_stats(self) -> Dict:
+        """Get connection metrics"""
+        avg_duration = 0.0
+        if self.connection_durations:
+            avg_duration = sum(self.connection_durations) / len(self.connection_durations)
+        
+        return {
+            'total_connections': self.total_connections,
+            'total_disconnections': self.total_disconnections,
+            'total_reconnect_attempts': self.total_reconnect_attempts,
+            'successful_reconnects': self.successful_reconnects,
+            'failed_reconnects': self.failed_reconnects,
+            'average_connection_duration_seconds': round(avg_duration, 2),
+            'last_connected_at': self.last_connected_at.isoformat() if self.last_connected_at else None,
+            'last_disconnected_at': self.last_disconnected_at.isoformat() if self.last_disconnected_at else None,
+            'recent_transitions': list(self.state_transitions)[-10:]
+        }
+
 
 class MarketDataClient:
     def __init__(self, config):
@@ -174,6 +378,10 @@ class MarketDataClient:
         self.simulator_task = None
         self.last_ping = 0
         
+        self._connection_state = ConnectionState.DISCONNECTED
+        self._connection_state_lock = asyncio.Lock()
+        self.connection_metrics = ConnectionMetrics()
+        
         self.m1_builder = OHLCBuilder(timeframe_minutes=1)
         self.m5_builder = OHLCBuilder(timeframe_minutes=5)
         
@@ -187,7 +395,10 @@ class MarketDataClient:
         
         self.subscribers = {}
         self.subscriber_failures = {}
+        self.subscriber_last_success = {}
+        self.subscriber_lock = asyncio.Lock()
         self.max_consecutive_failures = 5
+        self.subscriber_stale_timeout = 300
         self.tick_log_counter = 0
         
         self.ws_timeout = 30
@@ -197,18 +408,32 @@ class MarketDataClient:
         
         self._loading_from_db = False
         self._loaded_from_db = False
+        self._shutdown_in_progress = False
         
         self.circuit_breaker = CircuitBreaker(
-            failure_threshold=5,
-            recovery_timeout=30.0,
+            failure_threshold=3,
+            recovery_timeout=45.0,
             expected_exception=Exception,
             name="DerivWebSocket"
         )
         
         logger.info("MarketDataClient initialized with enhanced error handling")
         logger.info(f"WebSocket URL: {self.ws_url}, Symbol: {self.symbol}")
-        logger.info("Pub/Sub mechanism initialized")
-        logger.info("✅ Circuit breaker initialized for WebSocket connection")
+        logger.info("Pub/Sub mechanism initialized with lifecycle management")
+        logger.info("✅ Circuit breaker initialized for WebSocket connection (threshold=3, timeout=45s)")
+        logger.info("✅ Connection state machine initialized")
+    
+    async def _set_connection_state(self, new_state: ConnectionState):
+        """Thread-safe state transition with logging"""
+        async with self._connection_state_lock:
+            old_state = self._connection_state
+            self._connection_state = new_state
+            self.connection_metrics._add_transition(new_state)
+            logger.info(f"🔄 Connection state: {old_state.value} → {new_state.value}")
+    
+    def get_connection_state(self) -> ConnectionState:
+        """Get current connection state"""
+        return self._connection_state
     
     def _log_tick_sample(self, bid: float, ask: float, quote: float, spread: Optional[float] = None, mode: str = "") -> None:
         """Centralized tick logging dengan sampling - increment counter HANYA 1x per tick"""
@@ -225,65 +450,169 @@ class MarketDataClient:
                 logger.debug(f"💰 Tick: Bid={bid:.2f}, Ask={ask:.2f}, Quote={quote:.2f}")
     
     async def subscribe_ticks(self, name: str) -> asyncio.Queue:
-        queue = asyncio.Queue(maxsize=500)
-        self.subscribers[name] = queue
-        self.subscriber_failures[name] = 0
-        logger.debug(f"Subscriber '{name}' registered untuk tick feed")
-        return queue
+        """Subscribe to tick feed with proper lifecycle tracking"""
+        async with self.subscriber_lock:
+            if self._shutdown_in_progress:
+                raise RuntimeError("Cannot subscribe during shutdown")
+            
+            queue = asyncio.Queue(maxsize=500)
+            self.subscribers[name] = queue
+            self.subscriber_failures[name] = 0
+            self.subscriber_last_success[name] = time.time()
+            logger.debug(f"Subscriber '{name}' registered untuk tick feed")
+            return queue
     
     async def unsubscribe_ticks(self, name: str):
-        if name in self.subscribers:
-            del self.subscribers[name]
+        """Unsubscribe from tick feed with proper cleanup"""
+        async with self.subscriber_lock:
+            if name in self.subscribers:
+                try:
+                    queue = self.subscribers[name]
+                    while not queue.empty():
+                        try:
+                            queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            break
+                except Exception as e:
+                    logger.debug(f"Error draining queue for '{name}': {e}")
+                
+                del self.subscribers[name]
+                
             if name in self.subscriber_failures:
                 del self.subscriber_failures[name]
+            if name in self.subscriber_last_success:
+                del self.subscriber_last_success[name]
+            
             logger.debug(f"Subscriber '{name}' unregistered dari tick feed")
     
+    async def cleanup_stale_subscribers(self) -> List[str]:
+        """Clean up stale subscribers that haven't been active
+        
+        Returns:
+            List of removed subscriber names
+        """
+        removed = []
+        current_time = time.time()
+        
+        async with self.subscriber_lock:
+            stale_names = []
+            
+            for name in list(self.subscribers.keys()):
+                last_success = self.subscriber_last_success.get(name, 0)
+                failures = self.subscriber_failures.get(name, 0)
+                
+                is_stale = False
+                reason = ""
+                
+                if current_time - last_success > self.subscriber_stale_timeout:
+                    is_stale = True
+                    reason = f"inactive for {current_time - last_success:.0f}s"
+                elif failures >= self.max_consecutive_failures:
+                    is_stale = True
+                    reason = f"{failures} consecutive failures"
+                
+                if is_stale:
+                    stale_names.append(name)
+                    logger.warning(f"Subscriber '{name}' marked stale: {reason}")
+            
+            for name in stale_names:
+                try:
+                    queue = self.subscribers.get(name)
+                    if queue:
+                        while not queue.empty():
+                            try:
+                                queue.get_nowait()
+                            except asyncio.QueueEmpty:
+                                break
+                except Exception as e:
+                    logger.debug(f"Error draining stale queue '{name}': {e}")
+                
+                if name in self.subscribers:
+                    del self.subscribers[name]
+                if name in self.subscriber_failures:
+                    del self.subscriber_failures[name]
+                if name in self.subscriber_last_success:
+                    del self.subscriber_last_success[name]
+                
+                removed.append(name)
+                logger.info(f"Removed stale subscriber '{name}'")
+        
+        if removed:
+            logger.info(f"Cleaned up {len(removed)} stale subscribers: {removed}")
+        
+        return removed
+    
+    async def _unsubscribe_all(self):
+        """Unsubscribe all subscribers during shutdown"""
+        async with self.subscriber_lock:
+            subscriber_names = list(self.subscribers.keys())
+            
+            for name in subscriber_names:
+                try:
+                    queue = self.subscribers.get(name)
+                    if queue:
+                        while not queue.empty():
+                            try:
+                                queue.get_nowait()
+                            except asyncio.QueueEmpty:
+                                break
+                except Exception as e:
+                    logger.debug(f"Error draining queue '{name}' during shutdown: {e}")
+            
+            self.subscribers.clear()
+            self.subscriber_failures.clear()
+            self.subscriber_last_success.clear()
+            
+            if subscriber_names:
+                logger.info(f"Unsubscribed all {len(subscriber_names)} subscribers during shutdown")
+    
     async def _broadcast_tick(self, tick_data: Dict):
+        """Broadcast tick to subscribers with NaN validation at boundary"""
         if not self.subscribers:
             return
         
-        stale_subscribers = []
+        is_valid, sanitized_data, error_msg = sanitize_price_data(tick_data)
+        if not is_valid:
+            logger.warning(f"Tick data failed validation before broadcast: {error_msg}")
+            return
         
-        for name, queue in list(self.subscribers.items()):
-            success = False
-            max_retries = 3
-            
-            for attempt in range(max_retries):
-                try:
-                    queue.put_nowait(tick_data)
-                    success = True
-                    if name in self.subscriber_failures:
-                        self.subscriber_failures[name] = 0
-                    break
-                    
-                except asyncio.QueueFull:
-                    if attempt < max_retries - 1:
-                        backoff_time = 0.1 * (2 ** attempt)
-                        logger.debug(f"Queue full for '{name}', retry {attempt + 1}/{max_retries} after {backoff_time}s")
-                        await asyncio.sleep(backoff_time)
-                    else:
-                        logger.warning(f"Queue full for subscriber '{name}' after {max_retries} retries, skipping tick")
-                        
-                except Exception as e:
-                    logger.error(f"Error broadcasting tick to '{name}': {e}")
-                    break
-            
-            if not success:
-                if name in self.subscriber_failures:
-                    self.subscriber_failures[name] += 1
-                else:
-                    self.subscriber_failures[name] = 1
+        stale_subscribers = []
+        current_time = time.time()
+        
+        async with self.subscriber_lock:
+            for name, queue in list(self.subscribers.items()):
+                success = False
+                max_retries = 3
                 
-                if self.subscriber_failures[name] >= self.max_consecutive_failures:
-                    logger.warning(f"Subscriber '{name}' failed {self.subscriber_failures[name]} times consecutively, marking for removal")
-                    stale_subscribers.append(name)
+                for attempt in range(max_retries):
+                    try:
+                        queue.put_nowait(sanitized_data)
+                        success = True
+                        self.subscriber_failures[name] = 0
+                        self.subscriber_last_success[name] = current_time
+                        break
+                        
+                    except asyncio.QueueFull:
+                        if attempt < max_retries - 1:
+                            backoff_time = 0.1 * (2 ** attempt)
+                            logger.debug(f"Queue full for '{name}', retry {attempt + 1}/{max_retries} after {backoff_time}s")
+                            await asyncio.sleep(backoff_time)
+                        else:
+                            logger.warning(f"Queue full for subscriber '{name}' after {max_retries} retries, skipping tick")
+                            
+                    except Exception as e:
+                        logger.error(f"Error broadcasting tick to '{name}': {e}")
+                        break
+                
+                if not success:
+                    self.subscriber_failures[name] = self.subscriber_failures.get(name, 0) + 1
+                    
+                    if self.subscriber_failures[name] >= self.max_consecutive_failures:
+                        logger.warning(f"Subscriber '{name}' failed {self.subscriber_failures[name]} times consecutively, marking for removal")
+                        stale_subscribers.append(name)
         
         for name in stale_subscribers:
-            if name in self.subscribers:
-                del self.subscribers[name]
-            if name in self.subscriber_failures:
-                del self.subscriber_failures[name]
-            logger.info(f"Removed stale subscriber '{name}' due to consecutive failures")
+            await self.unsubscribe_ticks(name)
     
     async def fetch_historical_candles(self, websocket, timeframe_minutes: int = 1, count: int = 100):
         """Fetch historical candles from Deriv API with timeout and validation"""
@@ -339,6 +668,7 @@ class MarketDataClient:
                 builder = self.m1_builder if timeframe_minutes == 1 else self.m5_builder
                 
                 valid_candles = 0
+                nan_skipped = 0
                 for candle in candles:
                     try:
                         if not all(k in candle for k in ['epoch', 'open', 'high', 'low', 'close']):
@@ -352,6 +682,10 @@ class MarketDataClient:
                         high_price = float(candle['high'])
                         low_price = float(candle['low'])
                         close_price = float(candle['close'])
+                        
+                        if any(math.isnan(p) or math.isinf(p) for p in [open_price, high_price, low_price, close_price]):
+                            nan_skipped += 1
+                            continue
                         
                         if high_price < low_price:
                             logger.warning(f"Invalid candle: high < low ({high_price} < {low_price})")
@@ -376,6 +710,9 @@ class MarketDataClient:
                         logger.warning(f"Error processing candle: {e}")
                         continue
                 
+                if nan_skipped > 0:
+                    logger.warning(f"Skipped {nan_skipped} candles with NaN/Inf values")
+                
                 logger.info(f"Pre-populated {valid_candles} valid M{timeframe_minutes} candles")
                 return valid_candles > 0
             else:
@@ -388,13 +725,40 @@ class MarketDataClient:
         except Exception as e:
             logger.error(f"Error fetching historical candles for M{timeframe_minutes}: {e}", exc_info=True)
             return False
+    
+    def _calculate_backoff_with_jitter(self, attempt: int) -> float:
+        """Calculate exponential backoff with jitter for reconnection
+        
+        Uses decorrelated jitter algorithm for better distribution:
+        delay = min(max_delay, random(base_delay, previous_delay * 3))
+        
+        Args:
+            attempt: Current reconnection attempt number (1-based)
+            
+        Returns:
+            Delay in seconds with jitter applied
+        """
+        base_delay = self.reconnect_delay
+        max_delay = self.max_reconnect_delay
+        
+        exponential_delay = base_delay * (2 ** (attempt - 1))
+        
+        jitter_range = exponential_delay * 0.5
+        jitter = random.uniform(-jitter_range, jitter_range)
+        
+        delay_with_jitter = exponential_delay + jitter
+        
+        final_delay = max(base_delay, min(delay_with_jitter, max_delay))
+        
+        return final_delay
         
     async def connect_websocket(self):
-        """Connect to WebSocket with enhanced error handling and retry logic"""
+        """Connect to WebSocket with state machine and enhanced error handling"""
         self.running = True
         
         while self.running:
             try:
+                await self._set_connection_state(ConnectionState.CONNECTING)
                 logger.info(f"Connecting to Deriv WebSocket (attempt {self.reconnect_attempts + 1}): {self.ws_url}")
                 
                 try:
@@ -409,6 +773,8 @@ class MarketDataClient:
                         self.reconnect_attempts = 0
                         self.last_data_received = datetime.now()
                         
+                        await self._set_connection_state(ConnectionState.CONNECTED)
+                        self.connection_metrics.record_connection()
                         logger.info(f"✅ Connected to Deriv WebSocket successfully")
                         
                         if self._loaded_from_db and (len(self.m1_builder.candles) >= 30 or len(self.m5_builder.candles) >= 30):
@@ -444,6 +810,7 @@ class MarketDataClient:
                         
                         heartbeat_task = asyncio.create_task(self._send_heartbeat())
                         data_monitor_task = asyncio.create_task(self._monitor_data_staleness())
+                        stale_cleanup_task = asyncio.create_task(self._periodic_stale_cleanup())
                         
                         try:
                             async for message in websocket:
@@ -451,6 +818,7 @@ class MarketDataClient:
                         finally:
                             heartbeat_task.cancel()
                             data_monitor_task.cancel()
+                            stale_cleanup_task.cancel()
                             try:
                                 await heartbeat_task
                             except asyncio.CancelledError:
@@ -459,31 +827,49 @@ class MarketDataClient:
                                 await data_monitor_task
                             except asyncio.CancelledError:
                                 pass
+                            try:
+                                await stale_cleanup_task
+                            except asyncio.CancelledError:
+                                pass
                                 
                 except asyncio.TimeoutError:
                     logger.error(f"WebSocket connection timeout ({self.ws_timeout}s)")
                     self.connected = False
+                    self.connection_metrics.record_disconnection()
                     await self._handle_reconnect()
                     
             except websockets.exceptions.ConnectionClosed as e:
                 logger.warning(f"WebSocket connection closed: code={e.code}, reason={e.reason}")
                 self.connected = False
+                self.connection_metrics.record_disconnection()
                 await self._handle_reconnect()
                 
             except websockets.exceptions.WebSocketException as e:
                 logger.error(f"WebSocket protocol error: {e}")
                 self.connected = False
+                self.connection_metrics.record_disconnection()
                 await self._handle_reconnect()
                 
             except Exception as e:
                 logger.error(f"Unexpected WebSocket error: {type(e).__name__}: {e}", exc_info=True)
                 self.connected = False
+                self.connection_metrics.record_disconnection()
                 await self._handle_reconnect()
+    
+    async def _periodic_stale_cleanup(self):
+        """Periodically clean up stale subscribers"""
+        try:
+            while self.running and self.connected:
+                await asyncio.sleep(60)
+                await self.cleanup_stale_subscribers()
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.error(f"Error in periodic stale cleanup: {e}")
     
     async def _send_heartbeat(self):
         while self.running and self.ws:
             try:
-                import time
                 current_time = time.time()
                 if current_time - self.last_ping >= 20:
                     ping_msg = {"ping": 1}
@@ -503,7 +889,6 @@ class MarketDataClient:
                 if self.last_data_received:
                     elapsed = (datetime.now() - self.last_data_received).total_seconds()
                     
-                    # Forced reconnect jika data stale > 120s
                     if elapsed > 120:
                         logger.error(f"Data stale for {elapsed:.0f}s - forcing reconnection")
                         self.connected = False
@@ -514,7 +899,6 @@ class MarketDataClient:
                                 logger.debug(f"Error closing stale WebSocket: {close_error}")
                         break
                     
-                    # Warning jika mendekati threshold
                     elif elapsed > self.data_stale_threshold:
                         logger.warning(f"No data received for {elapsed:.0f}s (threshold: {self.data_stale_threshold}s)")
                         logger.warning("Data feed appears stale, will force reconnect if > 120s")
@@ -525,20 +909,41 @@ class MarketDataClient:
             logger.error(f"Error in data staleness monitor: {e}")
     
     async def _handle_reconnect(self):
-        """Handle reconnection with circuit breaker and exponential backoff"""
+        """Handle reconnection with state machine, circuit breaker, and enhanced backoff"""
         if not self.running:
             return
         
+        await self._set_connection_state(ConnectionState.RECONNECTING)
+        
+        cb_state = self.circuit_breaker.get_state()
+        if cb_state['state'] == 'OPEN':
+            remaining = self.circuit_breaker.recovery_timeout - (time.time() - (self.circuit_breaker.last_failure_time or 0))
+            if remaining > 0:
+                logger.warning(f"Circuit breaker OPEN - waiting {remaining:.1f}s before retry")
+                logger.warning("Falling back to simulator mode due to circuit breaker")
+                await self._set_connection_state(ConnectionState.DISCONNECTED)
+                self.use_simulator = True
+                self.connected = False
+                try:
+                    self._seed_initial_tick()
+                    await self._run_simulator()
+                except Exception as sim_error:
+                    logger.error(f"Failed to start simulator: {sim_error}", exc_info=True)
+                return
+        
         try:
             await self.circuit_breaker.call_async(self._attempt_reconnect)
+            self.connection_metrics.record_reconnect_attempt(success=True)
         except Exception as e:
-            logger.error(f"Circuit breaker prevented reconnection: {e}")
-            logger.warning("Circuit is OPEN - waiting for cooldown period before retry")
+            logger.error(f"Reconnection failed: {e}")
+            self.connection_metrics.record_reconnect_attempt(success=False)
+            
             cb_state = self.circuit_breaker.get_state()
             logger.info(f"Circuit Breaker State: {cb_state}")
             
             if cb_state['state'] == 'OPEN':
-                logger.warning("Falling back to simulator mode due to circuit breaker")
+                logger.warning("Circuit is OPEN - falling back to simulator mode")
+                await self._set_connection_state(ConnectionState.DISCONNECTED)
                 self.use_simulator = True
                 self.connected = False
                 try:
@@ -548,15 +953,15 @@ class MarketDataClient:
                     logger.error(f"Failed to start simulator: {sim_error}", exc_info=True)
     
     async def _attempt_reconnect(self):
-        """Internal reconnect logic protected by circuit breaker"""
+        """Internal reconnect logic with enhanced exponential backoff and jitter"""
         self.reconnect_attempts += 1
         
         if self.reconnect_attempts <= self.max_reconnect_attempts:
-            delay = min(self.reconnect_delay * (2 ** (self.reconnect_attempts - 1)), self.max_reconnect_delay)
+            delay = self._calculate_backoff_with_jitter(self.reconnect_attempts)
             
             logger.warning(
                 f"WebSocket reconnection attempt {self.reconnect_attempts}/{self.max_reconnect_attempts} "
-                f"in {delay:.1f}s (exponential backoff)"
+                f"in {delay:.1f}s (exponential backoff with jitter)"
             )
             logger.info(f"Connection status: URL accessible check for {self.ws_url}")
             
@@ -566,6 +971,7 @@ class MarketDataClient:
             logger.warning("Gracefully degrading to SIMULATOR MODE for continued operation")
             logger.info("Simulator provides synthetic market data for testing/fallback")
             
+            await self._set_connection_state(ConnectionState.DISCONNECTED)
             self.use_simulator = True
             self.connected = False
             
@@ -602,6 +1008,11 @@ class MarketDataClient:
                 self.current_timestamp = datetime.now(pytz.UTC)
                 self.current_quote = mid_price
                 
+                if not is_valid_price(self.current_bid) or not is_valid_price(self.current_ask):
+                    logger.warning("Simulator generated invalid prices, skipping tick")
+                    await asyncio.sleep(0.5)
+                    continue
+                
                 if not self._loading_from_db:
                     self.m1_builder.add_tick(self.current_bid, self.current_ask, self.current_timestamp)
                     self.m5_builder.add_tick(self.current_bid, self.current_ask, self.current_timestamp)
@@ -631,7 +1042,7 @@ class MarketDataClient:
         logger.info("Price simulator stopped")
     
     async def _on_message(self, message: str):
-        """Process incoming WebSocket message with validation"""
+        """Process incoming WebSocket message with validation and NaN handling"""
         try:
             if not message:
                 logger.warning("Received empty message")
@@ -672,8 +1083,8 @@ class MarketDataClient:
                         logger.error(f"Invalid bid/ask values: bid={bid}, ask={ask}, error={e}")
                         return
                     
-                    if bid_float <= 0 or ask_float <= 0:
-                        logger.warning(f"Non-positive bid/ask: bid={bid_float}, ask={ask_float}")
+                    if not is_valid_price(bid_float) or not is_valid_price(ask_float):
+                        logger.warning(f"Invalid prices detected (NaN/Inf/negative): bid={bid_float}, ask={ask_float}")
                         return
                     
                     if ask_float < bid_float:
@@ -682,7 +1093,7 @@ class MarketDataClient:
                     
                     self.current_bid = bid_float
                     self.current_ask = ask_float
-                    self.current_quote = float(quote) if quote else (self.current_bid + self.current_ask) / 2
+                    self.current_quote = float(quote) if quote and is_valid_price(float(quote)) else (self.current_bid + self.current_ask) / 2
                     self.current_timestamp = datetime.fromtimestamp(epoch, tz=pytz.UTC)
                     self.last_data_received = datetime.now()
                     
@@ -730,10 +1141,11 @@ class MarketDataClient:
     async def get_current_price(self) -> Optional[float]:
         """Get current mid price with validation"""
         try:
-            if self.current_bid is not None and self.current_ask is not None:
-                if self.current_bid > 0 and self.current_ask > 0 and self.current_ask >= self.current_bid:
+            if is_valid_price(self.current_bid) and is_valid_price(self.current_ask):
+                if self.current_ask >= self.current_bid:
                     mid_price = (self.current_bid + self.current_ask) / 2.0
-                    return mid_price
+                    if is_valid_price(mid_price):
+                        return mid_price
                 else:
                     logger.warning(f"Invalid bid/ask for price calculation: bid={self.current_bid}, ask={self.current_ask}")
             
@@ -747,8 +1159,8 @@ class MarketDataClient:
     async def get_bid_ask(self) -> Optional[Tuple[float, float]]:
         """Get current bid/ask with validation"""
         try:
-            if self.current_bid is not None and self.current_ask is not None:
-                if self.current_bid > 0 and self.current_ask > 0 and self.current_ask >= self.current_bid:
+            if is_valid_price(self.current_bid) and is_valid_price(self.current_ask):
+                if self.current_ask >= self.current_bid:
                     return (self.current_bid, self.current_ask)
                 else:
                     logger.warning(f"Invalid bid/ask: bid={self.current_bid}, ask={self.current_ask}")
@@ -762,12 +1174,12 @@ class MarketDataClient:
     async def get_spread(self) -> Optional[float]:
         """Get current spread with validation"""
         try:
-            if self.current_bid is not None and self.current_ask is not None:
-                if self.current_bid > 0 and self.current_ask > 0 and self.current_ask >= self.current_bid:
+            if is_valid_price(self.current_bid) and is_valid_price(self.current_ask):
+                if self.current_ask >= self.current_bid:
                     spread = self.current_ask - self.current_bid
-                    if spread >= 0:
+                    if spread >= 0 and not math.isnan(spread) and not math.isinf(spread):
                         return spread
-                    logger.warning(f"Negative spread calculated: {spread}")
+                    logger.warning(f"Invalid spread calculated: {spread}")
             
             return None
             
@@ -817,10 +1229,19 @@ class MarketDataClient:
                 
                 snapshots = {}
                 for timeframe, builder in [('M1', self.m1_builder), ('M5', self.m5_builder)]:
-                    snapshots[timeframe] = list(builder.candles)
+                    valid_candles = []
+                    for candle in builder.candles:
+                        is_valid, scrubbed = builder._scrub_nan_prices(candle)
+                        if is_valid:
+                            valid_candles.append(scrubbed)
+                    snapshots[timeframe] = valid_candles
+                    
                     if builder.current_candle:
-                        snapshots[timeframe + '_current'] = dict(builder.current_candle)
-                        logger.debug(f"Deep copied current_candle for {timeframe} to prevent mutation")
+                        is_valid, scrubbed = builder._scrub_nan_prices(builder.current_candle)
+                        if is_valid:
+                            snapshots[timeframe + '_current'] = scrubbed
+                        else:
+                            snapshots[timeframe + '_current'] = None
                     else:
                         snapshots[timeframe + '_current'] = None
                 
@@ -922,6 +1343,7 @@ class MarketDataClient:
                 
                 loaded_m1 = 0
                 loaded_m5 = 0
+                nan_skipped = 0
                 
                 for timeframe, builder in [('M1', self.m1_builder), ('M5', self.m5_builder)]:
                     candles = session.query(CandleData).filter(
@@ -950,12 +1372,22 @@ class MarketDataClient:
                         
                         recent_timestamps.append(ts)
                         
+                        open_val = float(candle.open)
+                        high_val = float(candle.high)
+                        low_val = float(candle.low)
+                        close_val = float(candle.close)
+                        
+                        if any(math.isnan(v) or math.isinf(v) for v in [open_val, high_val, low_val, close_val]):
+                            nan_skipped += 1
+                            logger.warning(f"Skipping candle with NaN/Inf at {ts} for {timeframe}")
+                            continue
+                        
                         candle_dict = {
                             'timestamp': ts,
-                            'open': float(candle.open),
-                            'high': float(candle.high),
-                            'low': float(candle.low),
-                            'close': float(candle.close),
+                            'open': open_val,
+                            'high': high_val,
+                            'low': low_val,
+                            'close': close_val,
                             'volume': float(candle.volume) if candle.volume else 0
                         }
                         builder.candles.append(candle_dict)
@@ -971,6 +1403,9 @@ class MarketDataClient:
                         loaded_m5 = len(builder.candles)
                 
                 session.close()
+                
+                if nan_skipped > 0:
+                    logger.warning(f"Skipped {nan_skipped} candles with NaN/Inf values during load")
                 
                 if loaded_m1 > 0 or loaded_m5 > 0:
                     logger.info(f"✅ Loaded candles from database: M1={loaded_m1}, M5={loaded_m5}")
@@ -1082,7 +1517,30 @@ class MarketDataClient:
                     pass
             return 0
     
+    async def shutdown(self):
+        """Graceful shutdown with proper cleanup of all resources"""
+        logger.info("Initiating MarketDataClient shutdown...")
+        self._shutdown_in_progress = True
+        
+        self.running = False
+        self.use_simulator = False
+        
+        await self._unsubscribe_all()
+        
+        self.connected = False
+        if self.ws:
+            try:
+                await self.ws.close()
+                logger.debug("WebSocket closed during shutdown")
+            except Exception as e:
+                logger.debug(f"Error closing WebSocket during shutdown: {e}")
+        
+        await self._set_connection_state(ConnectionState.DISCONNECTED)
+        
+        logger.info("MarketDataClient shutdown complete")
+    
     def disconnect(self):
+        """Synchronous disconnect - use shutdown() for async cleanup"""
         self.running = False
         self.use_simulator = False
         self.connected = False
@@ -1097,7 +1555,13 @@ class MarketDataClient:
         return {
             'connected': self.connected,
             'simulator_mode': self.use_simulator,
+            'connection_state': self._connection_state.value,
             'reconnect_attempts': self.reconnect_attempts,
             'has_data': self.current_bid is not None and self.current_ask is not None,
-            'websocket_url': self.ws_url
+            'websocket_url': self.ws_url,
+            'subscriber_count': len(self.subscribers),
+            'circuit_breaker': self.circuit_breaker.get_state(),
+            'connection_metrics': self.connection_metrics.get_stats(),
+            'm1_builder_stats': self.m1_builder.get_stats(),
+            'm5_builder_stats': self.m5_builder.get_stats()
         }
