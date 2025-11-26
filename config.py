@@ -66,6 +66,11 @@ class Config:
     EMA_PERIODS = _parse_int_list(os.getenv('EMA_PERIODS', '5,10,20'), [5, 10, 20])
     EMA_PERIODS_LONG = _parse_int_list(os.getenv('EMA_PERIODS_LONG', '50'), [50])
     
+    MEMORY_WARNING_THRESHOLD_MB = _get_int_env('MEMORY_WARNING_THRESHOLD_MB', '400')
+    MEMORY_CRITICAL_THRESHOLD_MB = _get_int_env('MEMORY_CRITICAL_THRESHOLD_MB', '450')
+    OOM_GRACEFUL_DEGRADATION = os.getenv('OOM_GRACEFUL_DEGRADATION', 'true').lower() == 'true'
+    MAX_CANDLE_HISTORY = _get_int_env('MAX_CANDLE_HISTORY', '200') if FREE_TIER_MODE else _get_int_env('MAX_CANDLE_HISTORY', '500')
+    
     @classmethod
     def get_masked_token(cls) -> str:
         from bot.logger import mask_token
@@ -166,3 +171,63 @@ class Config:
     
     XAUUSD_PIP_VALUE = 10.0
     LOT_SIZE = 0.01
+    
+    @classmethod
+    def check_memory_status(cls) -> dict:
+        """Check current memory usage and return status
+        
+        Returns:
+            dict: Memory status with level ('normal', 'warning', 'critical')
+        """
+        try:
+            import psutil
+            process = psutil.Process()
+            mem_info = process.memory_info()
+            mem_mb = mem_info.rss / (1024 * 1024)
+            
+            status = 'normal'
+            if mem_mb >= cls.MEMORY_CRITICAL_THRESHOLD_MB:
+                status = 'critical'
+            elif mem_mb >= cls.MEMORY_WARNING_THRESHOLD_MB:
+                status = 'warning'
+            
+            return {
+                'memory_mb': round(mem_mb, 2),
+                'warning_threshold': cls.MEMORY_WARNING_THRESHOLD_MB,
+                'critical_threshold': cls.MEMORY_CRITICAL_THRESHOLD_MB,
+                'status': status,
+                'graceful_degradation_enabled': cls.OOM_GRACEFUL_DEGRADATION
+            }
+        except ImportError:
+            return {'status': 'unknown', 'error': 'psutil not available'}
+        except Exception as e:
+            return {'status': 'error', 'error': str(e)}
+    
+    @classmethod
+    def should_degrade_gracefully(cls) -> bool:
+        """Check if bot should enter graceful degradation mode
+        
+        Returns:
+            bool: True if memory is critical and degradation is enabled
+        """
+        if not cls.OOM_GRACEFUL_DEGRADATION:
+            return False
+        
+        status = cls.check_memory_status()
+        return status.get('status') == 'critical'
+    
+    @classmethod
+    def get_adjusted_settings(cls) -> dict:
+        """Get adjusted settings based on memory status
+        
+        Returns settings that should be reduced when memory is critical
+        """
+        if not cls.should_degrade_gracefully():
+            return {}
+        
+        return {
+            'max_candle_history': 100,
+            'chart_generation': False,
+            'signal_cache_expiry': 60,
+            'position_update_interval': 5
+        }

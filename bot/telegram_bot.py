@@ -222,6 +222,9 @@ class TradingBot:
         self.signal_cache_expiry_seconds = 120
         self.signal_price_tolerance_pips = 10.0
         self._cache_lock = asyncio.Lock()
+        self._dashboard_lock = asyncio.Lock()
+        self._cache_cleanup_task: Optional[asyncio.Task] = None
+        self._dashboard_cleanup_task: Optional[asyncio.Task] = None
         logger.info("✅ Two-phase anti-duplicate signal cache initialized (pending→confirmed)")
         
         import os
@@ -304,6 +307,137 @@ class TradingBot:
             else:
                 self.sent_signals_cache.clear()
                 logger.debug("Cleared all signal cache")
+    
+    async def start_background_cleanup_tasks(self):
+        """Mulai background tasks untuk cleanup cache dan dashboards"""
+        if self._cache_cleanup_task is None or self._cache_cleanup_task.done():
+            self._cache_cleanup_task = asyncio.create_task(self._signal_cache_cleanup_loop())
+            logger.info("✅ Signal cache cleanup background task started")
+        
+        if self._dashboard_cleanup_task is None or self._dashboard_cleanup_task.done():
+            self._dashboard_cleanup_task = asyncio.create_task(self._dashboard_cleanup_loop())
+            logger.info("✅ Dashboard cleanup background task started")
+    
+    async def stop_background_cleanup_tasks(self):
+        """Stop background cleanup tasks"""
+        if self._cache_cleanup_task and not self._cache_cleanup_task.done():
+            self._cache_cleanup_task.cancel()
+            try:
+                await self._cache_cleanup_task
+            except asyncio.CancelledError:
+                pass
+            logger.info("Signal cache cleanup task stopped")
+        
+        if self._dashboard_cleanup_task and not self._dashboard_cleanup_task.done():
+            self._dashboard_cleanup_task.cancel()
+            try:
+                await self._dashboard_cleanup_task
+            except asyncio.CancelledError:
+                pass
+            logger.info("Dashboard cleanup task stopped")
+    
+    async def _signal_cache_cleanup_loop(self):
+        """Background task untuk cleanup expired signal cache entries"""
+        cleanup_interval = 60
+        
+        try:
+            while True:
+                await asyncio.sleep(cleanup_interval)
+                
+                try:
+                    cleaned = await self._cleanup_expired_cache_entries()
+                    if cleaned > 0:
+                        logger.debug(f"Signal cache cleanup: removed {cleaned} expired entries")
+                except Exception as e:
+                    logger.error(f"Error in signal cache cleanup: {e}")
+                    
+        except asyncio.CancelledError:
+            logger.info("Signal cache cleanup loop cancelled")
+    
+    async def _cleanup_expired_cache_entries(self) -> int:
+        """Cleanup expired entries dari signal cache"""
+        async with self._cache_lock:
+            now = datetime.now()
+            expired_keys = [
+                k for k, v in self.sent_signals_cache.items() 
+                if (now - v['timestamp']).total_seconds() > self.signal_cache_expiry_seconds
+            ]
+            
+            for k in expired_keys:
+                self.sent_signals_cache.pop(k, None)
+            
+            return len(expired_keys)
+    
+    async def _dashboard_cleanup_loop(self):
+        """Background task untuk cleanup dead/stale dashboards"""
+        cleanup_interval = 30
+        max_dashboard_age_seconds = 3600
+        
+        try:
+            while True:
+                await asyncio.sleep(cleanup_interval)
+                
+                try:
+                    cleaned = await self._cleanup_stale_dashboards(max_dashboard_age_seconds)
+                    if cleaned > 0:
+                        logger.info(f"Dashboard cleanup: removed {cleaned} stale entries")
+                except Exception as e:
+                    logger.error(f"Error in dashboard cleanup: {e}")
+                    
+        except asyncio.CancelledError:
+            logger.info("Dashboard cleanup loop cancelled")
+    
+    async def _cleanup_stale_dashboards(self, max_age_seconds: int = 3600) -> int:
+        """Cleanup stale dashboard entries"""
+        cleaned = 0
+        stale_users = []
+        
+        async with self._dashboard_lock:
+            now = datetime.now()
+            
+            for user_id, dashboard_info in list(self.active_dashboards.items()):
+                try:
+                    task = dashboard_info.get('task')
+                    created_at = dashboard_info.get('created_at', now)
+                    
+                    age_seconds = (now - created_at).total_seconds() if isinstance(created_at, datetime) else 0
+                    
+                    is_stale = False
+                    if task is None:
+                        is_stale = True
+                    elif task.done():
+                        is_stale = True
+                    elif age_seconds > max_age_seconds:
+                        is_stale = True
+                        if not task.done():
+                            task.cancel()
+                    
+                    if is_stale:
+                        stale_users.append(user_id)
+                        
+                except Exception as e:
+                    logger.error(f"Error checking dashboard for user {user_id}: {e}")
+                    stale_users.append(user_id)
+            
+            for user_id in stale_users:
+                self.active_dashboards.pop(user_id, None)
+                cleaned += 1
+        
+        return cleaned
+    
+    def get_cache_stats(self) -> Dict:
+        """Dapatkan statistik cache untuk monitoring"""
+        try:
+            return {
+                'signal_cache_size': len(self.sent_signals_cache),
+                'active_dashboards': len(self.active_dashboards),
+                'monitoring_chats': len(self.monitoring_chats),
+                'monitoring_tasks': len(self.monitoring_tasks),
+                'cache_expiry_seconds': self.signal_cache_expiry_seconds
+            }
+        except Exception as e:
+            logger.error(f"Error getting cache stats: {e}")
+            return {'error': str(e)}
     
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:

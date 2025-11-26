@@ -255,18 +255,47 @@ class TradingBotOrchestrator:
                 market_status = 'not_initialized' if not self.config_valid else (self.market_data.get_status() if self.market_data else 'not_initialized')
                 
                 db_status = 'unknown'
+                position_count = 0
                 try:
                     session = self.db_manager.get_session()
                     result = session.execute(text('SELECT 1'))
                     result.fetchone()
+                    
+                    try:
+                        count_result = session.execute(text("SELECT COUNT(*) FROM positions WHERE status = 'open'"))
+                        position_count = count_result.scalar() or 0
+                    except Exception:
+                        position_count = 0
+                    
                     session.close()
                     db_status = 'connected'
                 except Exception as e:
                     db_status = f'error: {str(e)[:50]}'
                     logger.error(f"Database health check failed: {e}")
                 
+                memory_status = self.config.check_memory_status()
+                
+                cache_stats = {}
+                chart_stats = {}
+                if self.config_valid and self.telegram_bot:
+                    try:
+                        cache_stats = self.telegram_bot.get_cache_stats()
+                    except Exception:
+                        cache_stats = {'error': 'unavailable'}
+                
+                if self.config_valid and self.chart_generator:
+                    try:
+                        chart_stats = self.chart_generator.get_stats()
+                    except Exception:
+                        chart_stats = {'error': 'unavailable'}
+                
                 mode = 'full' if self.config_valid else 'limited'
-                overall_status = 'healthy' if self.config_valid and self.running else 'limited' if not self.config_valid else 'stopped'
+                
+                is_degraded = self.config.should_degrade_gracefully()
+                if is_degraded:
+                    mode = 'degraded'
+                
+                overall_status = 'healthy' if self.config_valid and self.running and not is_degraded else 'degraded' if is_degraded else 'limited' if not self.config_valid else 'stopped'
                 
                 health_status = {
                     'status': overall_status,
@@ -277,8 +306,13 @@ class TradingBotOrchestrator:
                     'telegram_bot': 'running' if self.config_valid and self.telegram_bot and self.telegram_bot.app else 'not_initialized',
                     'scheduler': 'running' if self.config_valid and self.task_scheduler and self.task_scheduler.running else 'not_initialized',
                     'database': db_status,
+                    'open_positions': position_count,
                     'webhook_mode': self.config.TELEGRAM_WEBHOOK_MODE if self.config_valid else False,
-                    'message': 'Bot running in limited mode - set missing environment variables to enable full functionality' if not self.config_valid else 'Bot running normally'
+                    'memory': memory_status,
+                    'cache_stats': cache_stats,
+                    'chart_stats': chart_stats,
+                    'free_tier_mode': self.config.FREE_TIER_MODE,
+                    'message': 'Bot running in degraded mode - memory critical' if is_degraded else 'Bot running in limited mode - set missing environment variables to enable full functionality' if not self.config_valid else 'Bot running normally'
                 }
                 
                 status_code = 200 if self.config_valid and self.running else 503
@@ -501,6 +535,9 @@ class TradingBotOrchestrator:
                     logger.error("Bot will continue but WILL NOT respond to commands!")
                     logger.error("=" * 60)
             
+            logger.info("Starting background cleanup tasks...")
+            await self.telegram_bot.start_background_cleanup_tasks()
+            
             logger.info("Starting Telegram bot polling...")
             bot_task = asyncio.create_task(self.telegram_bot.run())
             self.tracked_tasks.append(bot_task)
@@ -626,6 +663,15 @@ class TradingBotOrchestrator:
                     logger.info("All tracked tasks completed")
                 except asyncio.TimeoutError:
                     logger.warning("Some tasks did not complete within timeout")
+            
+            logger.info("Stopping background cleanup tasks...")
+            if self.telegram_bot:
+                try:
+                    await asyncio.wait_for(self.telegram_bot.stop_background_cleanup_tasks(), timeout=5)
+                except asyncio.TimeoutError:
+                    logger.warning("Background cleanup tasks shutdown timed out")
+                except Exception as e:
+                    logger.error(f"Error stopping background cleanup tasks: {e}")
             
             logger.info("Stopping Telegram bot...")
             if self.telegram_bot:

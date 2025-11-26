@@ -11,7 +11,6 @@ Bot trading otomatis untuk XAUUSD (Gold) dengan Telegram integration, dual-mode 
 - ✅ **Chart Generation** - Setiap sinyal dengan chart + indikator lengkap
 - ✅ **Risk Management** - Dynamic SL/TP, spread filter, daily loss limit
 - ✅ **Signal Source Tracking** - Database track auto vs manual terpisah
-- ✅ **Premium Subscription** - Paket mingguan/bulanan dengan auto-expiry
 - ✅ **Admin Commands** - User management & database control
 - ✅ **24/7 Monitoring** - Auto-start untuk authorized users
 - ✅ **Auto-Migration** - Database schema updates tanpa data loss
@@ -78,14 +77,8 @@ Bot trading otomatis untuk XAUUSD (Gold) dengan Telegram integration, dual-mode 
 /systemhealth - Status sistem (CPU, Memory, WebSocket)
 /tasks        - Lihat scheduled tasks
 
-👑 PREMIUM
-/premium     - Info paket subscription
-/beli        - Cara langganan premium
-/langganan   - Cek status langganan
-
 🔧 ADMIN ONLY
-/riset       - Reset database trading & monitoring
-/addpremium  - Tambah user premium
+/riset       - Reset database trading
 ```
 
 ## 🚀 Quick Start
@@ -197,22 +190,6 @@ Setiap sinyal disertai chart profesional:
 
 Auto-cleanup setelah 60 menit untuk hemat storage.
 
-## 💎 Premium Subscription
-
-**Paket Tersedia:**
-- **Weekly:** Rp 15.000 (7 hari)
-- **Monthly:** Rp 30.000 (30 hari)
-
-**Benefits:**
-- ✅ Unlimited signals 24/7
-- ✅ Auto-monitoring
-- ✅ Position tracking
-- ✅ All premium features
-
-**Cara Beli:** Hubungi @dzeckyete di Telegram
-
-**Admin:** Akses unlimited selamanya
-
 ## 🔧 Admin Commands
 
 Bot menyediakan command khusus untuk admin untuk mengelola user dan database:
@@ -234,32 +211,6 @@ Command ini akan mereset seluruh database trading dan menghentikan semua aktivit
 ```
 
 **Catatan:** Command ini hanya bisa digunakan oleh admin dan akan membersihkan semua data trading. Gunakan dengan hati-hati!
-
-### /addpremium - Tambah User Premium
-
-Command ini digunakan untuk memberikan akses premium kepada user.
-
-**Format:**
-```
-/addpremium <user_id/@username> <durasi>
-```
-
-**Durasi yang tersedia:**
-- `1week` - 1 Minggu (7 hari)
-- `1month` - 1 Bulan (30 hari)
-
-**Contoh penggunaan:**
-```
-/addpremium 123456789 1month
-/addpremium @dzeckyete 1week
-```
-
-**Cara kerja:**
-1. Bot akan mencari user berdasarkan ID atau username
-2. Jika user belum terdaftar, bot akan otomatis membuat akun
-3. Subscription akan ditambahkan sesuai durasi yang dipilih
-4. User akan menerima notifikasi tentang upgrade premium
-5. Admin akan menerima konfirmasi beserta detail subscription
 
 ## 📈 Performance Tracking
 

@@ -3,9 +3,10 @@ Signal Session Manager
 Mengelola sesi sinyal untuk mencegah duplikasi dan konflik antara mode auto & manual
 """
 import asyncio
+import weakref
 from datetime import datetime
-from typing import Optional, Dict, Callable
-from dataclasses import dataclass
+from typing import Optional, Dict, Callable, List
+from dataclasses import dataclass, field
 import pytz
 from bot.logger import setup_logger
 
@@ -25,23 +26,27 @@ class SignalSession:
     trade_id: Optional[int]
     started_at: datetime
     chart_path: Optional[str] = None
-    photo_sent: bool = False  # Track if photo already sent to prevent duplicates
+    photo_sent: bool = False
 
 class SignalSessionManager:
     """
     Manager untuk mengelola sesi sinyal secara global
     Mencegah sinyal duplikat dan konflik antara auto/manual mode
+    
+    Thread-safe dengan proper locking untuk mencegah race conditions
     """
     
     def __init__(self):
         self.active_sessions: Dict[int, SignalSession] = {}
         self._session_lock = asyncio.Lock()
-        self._event_handlers: Dict[str, list[Callable]] = {
+        self._event_lock = asyncio.Lock()
+        self._event_handlers: Dict[str, List[Callable]] = {
             'on_session_start': [],
             'on_session_end': [],
             'on_session_update': []
         }
-        logger.info("Signal Session Manager initialized")
+        self._pending_events: List[tuple] = []
+        logger.info("Signal Session Manager initialized with enhanced locking")
     
     def register_event_handler(self, event: str, handler: Callable):
         """Daftarkan event handler untuk lifecycle events"""
@@ -50,8 +55,10 @@ class SignalSessionManager:
             logger.debug(f"Event handler registered for: {event}")
     
     async def _emit_event(self, event: str, session: SignalSession):
-        """Emit event ke semua registered handlers"""
-        handlers = self._event_handlers.get(event, [])
+        """Emit event ke semua registered handlers dengan safe copy"""
+        async with self._event_lock:
+            handlers = list(self._event_handlers.get(event, []))
+        
         for handler in handlers:
             try:
                 if asyncio.iscoroutinefunction(handler):
@@ -60,6 +67,20 @@ class SignalSessionManager:
                     handler(session)
             except Exception as e:
                 logger.error(f"Error in event handler for {event}: {e}")
+    
+    async def _emit_event_deferred(self, event: str, session: SignalSession):
+        """Queue event untuk emit setelah lock released (prevent deadlock)"""
+        self._pending_events.append((event, session))
+    
+    async def _process_pending_events(self):
+        """Process queued events setelah lock released"""
+        events_to_process = []
+        async with self._event_lock:
+            events_to_process = self._pending_events.copy()
+            self._pending_events.clear()
+        
+        for event, session in events_to_process:
+            await self._emit_event(event, session)
     
     async def can_create_signal(self, user_id: int, signal_source: str) -> tuple[bool, Optional[str]]:
         """
@@ -134,23 +155,17 @@ class SignalSessionManager:
             return True
     
     async def end_session(self, user_id: int, reason: str = "closed"):
-        """Akhiri sesi sinyal dan cleanup chart jika ada"""
+        """Akhiri sesi sinyal dan cleanup chart jika ada - thread safe"""
+        session = None
+        chart_path = None
+        
         async with self._session_lock:
             if user_id not in self.active_sessions:
                 logger.debug(f"No active session to end for user {user_id}")
                 return None
             
             session = self.active_sessions[user_id]
-            
-            # Cleanup chart file if exists
-            if session.chart_path:
-                try:
-                    import os
-                    if os.path.exists(session.chart_path):
-                        os.remove(session.chart_path)
-                        logger.info(f"🗑️ Cleaned up session chart: {session.chart_path}")
-                except Exception as e:
-                    logger.warning(f"Failed to cleanup chart {session.chart_path}: {e}")
+            chart_path = session.chart_path
             
             del self.active_sessions[user_id]
             
@@ -161,18 +176,39 @@ class SignalSessionManager:
                 f"🏁 Signal session ended - User:{user_id} {icon} {session.signal_source.upper()} "
                 f"Reason:{reason} Duration:{duration:.1f}s"
             )
-            
-            await self._emit_event('on_session_end', session)
-            
-            return session
+        
+        if chart_path:
+            await self._cleanup_chart_file(chart_path)
+        
+        await self._emit_event('on_session_end', session)
+        
+        return session
+    
+    async def _cleanup_chart_file(self, chart_path: str):
+        """Cleanup chart file secara async dan atomic"""
+        try:
+            import os
+            if chart_path and os.path.exists(chart_path):
+                os.remove(chart_path)
+                logger.info(f"🗑️ Cleaned up session chart: {chart_path}")
+                
+                if os.path.exists(chart_path):
+                    logger.warning(f"Chart file still exists after deletion: {chart_path}")
+        except FileNotFoundError:
+            logger.debug(f"Chart file already deleted: {chart_path}")
+        except Exception as e:
+            logger.warning(f"Failed to cleanup chart {chart_path}: {e}")
     
     async def clear_all_sessions(self, reason: str = "system_reset") -> int:
         """
-        Hapus semua sesi sinyal aktif (untuk system reset)
+        Hapus semua sesi sinyal aktif (untuk system reset) - thread safe
         
         Returns:
             int: Jumlah sesi yang dibersihkan
         """
+        sessions_to_end = []
+        chart_paths = []
+        
         async with self._session_lock:
             session_count = len(self.active_sessions)
             
@@ -183,6 +219,7 @@ class SignalSessionManager:
             logger.info(f"Clearing all {session_count} active signal sessions...")
             
             sessions_to_end = list(self.active_sessions.values())
+            chart_paths = [s.chart_path for s in sessions_to_end if s.chart_path]
             
             for session in sessions_to_end:
                 duration = (datetime.now(pytz.UTC) - session.started_at).total_seconds()
@@ -192,17 +229,21 @@ class SignalSessionManager:
                     f"🏁 Clearing session - User:{session.user_id} {icon} {session.signal_source.upper()} "
                     f"Type:{session.signal_type} Reason:{reason} Duration:{duration:.1f}s"
                 )
-                
-                try:
-                    await self._emit_event('on_session_end', session)
-                except Exception as e:
-                    logger.error(f"Error emitting end event for session {session.signal_id}: {e}")
             
             self.active_sessions.clear()
-            
-            logger.info(f"✅ All {session_count} signal sessions cleared successfully")
-            
-            return session_count
+        
+        for chart_path in chart_paths:
+            await self._cleanup_chart_file(chart_path)
+        
+        for session in sessions_to_end:
+            try:
+                await self._emit_event('on_session_end', session)
+            except Exception as e:
+                logger.error(f"Error emitting end event for session {session.signal_id}: {e}")
+        
+        logger.info(f"✅ All {session_count} signal sessions cleared successfully")
+        
+        return session_count
     
     def get_active_session(self, user_id: int) -> Optional[SignalSession]:
         """Ambil sesi aktif untuk user"""

@@ -66,6 +66,9 @@ class ChartGenerator:
         os.makedirs(self.chart_dir, exist_ok=True)
         max_workers = 1 if self.config.FREE_TIER_MODE else 2
         self.executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="chart_gen")
+        self._shutdown_requested = False
+        self._pending_charts: set = set()
+        self._chart_lock = asyncio.Lock()
         logger.info(f"ChartGenerator initialized dengan max_workers={max_workers} (FREE_TIER_MODE={self.config.FREE_TIER_MODE})")
     
     def generate_chart(self, df: pd.DataFrame, signal: Optional[dict] = None,
@@ -312,22 +315,114 @@ class ChartGenerator:
             return False
     
     def shutdown(self):
+        """Graceful shutdown dengan cleanup semua pending charts"""
         try:
             logger.info("Shutting down ChartGenerator executor...")
+            self._shutdown_requested = True
+            
             self.executor.shutdown(wait=True, cancel_futures=True)
+            
+            self._cleanup_pending_charts()
+            
             logger.info("ChartGenerator executor shut down successfully")
         except Exception as e:
             logger.error(f"Error shutting down executor: {e}")
     
-    def cleanup_old_charts(self, days: int = 7):
+    def _cleanup_pending_charts(self):
+        """Cleanup semua pending chart files"""
+        try:
+            cleaned = 0
+            for chart_path in list(self._pending_charts):
+                try:
+                    if os.path.exists(chart_path):
+                        os.remove(chart_path)
+                        cleaned += 1
+                except Exception as e:
+                    logger.warning(f"Failed to cleanup pending chart {chart_path}: {e}")
+            
+            self._pending_charts.clear()
+            
+            if cleaned > 0:
+                logger.info(f"🗑️ Cleaned up {cleaned} pending chart files")
+        except Exception as e:
+            logger.error(f"Error cleaning up pending charts: {e}")
+    
+    def track_chart(self, filepath: str):
+        """Track chart file untuk cleanup nanti"""
+        if filepath:
+            self._pending_charts.add(filepath)
+    
+    def untrack_chart(self, filepath: str):
+        """Untrack chart file setelah berhasil dikirim"""
+        self._pending_charts.discard(filepath)
+    
+    async def cleanup_orphan_charts(self, max_age_minutes: int = 30) -> int:
+        """Cleanup orphan chart files yang lebih tua dari max_age"""
         try:
             now = datetime.now()
+            cleaned = 0
+            
+            async with self._chart_lock:
+                for filename in os.listdir(self.chart_dir):
+                    filepath = os.path.join(self.chart_dir, filename)
+                    if os.path.isfile(filepath) and filename.endswith('.png'):
+                        try:
+                            file_time = datetime.fromtimestamp(os.path.getmtime(filepath))
+                            age_minutes = (now - file_time).total_seconds() / 60
+                            
+                            if age_minutes > max_age_minutes:
+                                os.remove(filepath)
+                                self._pending_charts.discard(filepath)
+                                cleaned += 1
+                        except Exception as e:
+                            logger.warning(f"Error checking chart age {filepath}: {e}")
+            
+            if cleaned > 0:
+                logger.info(f"🗑️ Cleaned up {cleaned} orphan chart files (older than {max_age_minutes}min)")
+            
+            return cleaned
+        except Exception as e:
+            logger.error(f"Error cleaning orphan charts: {e}")
+            return 0
+    
+    def cleanup_old_charts(self, days: int = 7):
+        """Cleanup chart files yang lebih tua dari X hari"""
+        try:
+            now = datetime.now()
+            cleaned = 0
             for filename in os.listdir(self.chart_dir):
                 filepath = os.path.join(self.chart_dir, filename)
                 if os.path.isfile(filepath):
-                    file_time = datetime.fromtimestamp(os.path.getmtime(filepath))
-                    if (now - file_time).days > days:
-                        os.remove(filepath)
-                        logger.info(f"Deleted old chart: {filename}")
+                    try:
+                        file_time = datetime.fromtimestamp(os.path.getmtime(filepath))
+                        if (now - file_time).days > days:
+                            os.remove(filepath)
+                            self._pending_charts.discard(filepath)
+                            cleaned += 1
+                            logger.debug(f"Deleted old chart: {filename}")
+                    except FileNotFoundError:
+                        pass
+                    except Exception as e:
+                        logger.warning(f"Error deleting chart {filename}: {e}")
+            
+            if cleaned > 0:
+                logger.info(f"🗑️ Cleaned up {cleaned} old chart files (older than {days} days)")
         except Exception as e:
             logger.error(f"Error cleaning up charts: {e}")
+    
+    def get_stats(self) -> dict:
+        """Dapatkan statistik chart generator"""
+        try:
+            chart_count = len([f for f in os.listdir(self.chart_dir) if f.endswith('.png')])
+            pending_count = len(self._pending_charts)
+            
+            return {
+                'chart_dir': self.chart_dir,
+                'total_charts': chart_count,
+                'pending_charts': pending_count,
+                'shutdown_requested': self._shutdown_requested,
+                'free_tier_mode': self.config.FREE_TIER_MODE
+            }
+        except Exception as e:
+            logger.error(f"Error getting chart stats: {e}")
+            return {'error': str(e)}

@@ -3,16 +3,20 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, scoped_session
 from sqlalchemy.exc import SQLAlchemyError, OperationalError, IntegrityError
 from sqlalchemy.exc import DatabaseError as SQLAlchemyDatabaseError
+from contextlib import contextmanager
 from datetime import datetime
 import os
 import time
-from typing import Callable, Any
+import threading
+from typing import Callable, Any, Optional, Generator
 from functools import wraps
 import logging
 
 logger = logging.getLogger('DatabaseManager')
 
 Base = declarative_base()
+
+_transaction_lock = threading.Lock()
 
 class DatabaseError(Exception):
     """Base exception for database errors"""
@@ -410,6 +414,96 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"Error creating database session: {e}")
             raise DatabaseError(f"Failed to create session: {e}")
+    
+    @contextmanager
+    def transaction_scope(self, isolation_level: Optional[str] = None) -> Generator:
+        """
+        Provide a transactional scope with proper isolation.
+        
+        Args:
+            isolation_level: Optional isolation level ('SERIALIZABLE', 'REPEATABLE READ', 'READ COMMITTED')
+        
+        Usage:
+            with db.transaction_scope() as session:
+                # do database operations
+                session.add(...)
+                # auto-commit on success, auto-rollback on failure
+        """
+        session = self.Session()
+        
+        try:
+            if isolation_level and self.is_postgres:
+                session.execute(text(f"SET TRANSACTION ISOLATION LEVEL {isolation_level}"))
+            
+            yield session
+            session.commit()
+            
+        except Exception as e:
+            session.rollback()
+            logger.error(f"Transaction rolled back: {type(e).__name__}: {e}")
+            raise
+        finally:
+            session.close()
+    
+    @contextmanager
+    def serializable_transaction(self) -> Generator:
+        """
+        Provide a serializable transaction scope for concurrent user operations.
+        Prevents race conditions when multiple users trading simultaneously.
+        """
+        with _transaction_lock:
+            with self.transaction_scope('SERIALIZABLE' if self.is_postgres else None) as session:
+                yield session
+    
+    def atomic_create_trade(self, session, trade_data: dict) -> Optional[int]:
+        """
+        Create trade atomically with proper locking.
+        
+        Args:
+            session: Database session
+            trade_data: Trade data dictionary
+            
+        Returns:
+            Trade ID if successful, None otherwise
+        """
+        try:
+            from bot.database import Trade
+            
+            trade = Trade(**trade_data)
+            session.add(trade)
+            session.flush()
+            trade_id = trade.id
+            
+            return trade_id
+            
+        except Exception as e:
+            logger.error(f"Error creating trade atomically: {e}")
+            raise
+    
+    def atomic_create_position(self, session, position_data: dict) -> Optional[int]:
+        """
+        Create position atomically with proper locking.
+        
+        Args:
+            session: Database session  
+            position_data: Position data dictionary
+            
+        Returns:
+            Position ID if successful, None otherwise
+        """
+        try:
+            from bot.database import Position
+            
+            position = Position(**position_data)
+            session.add(position)
+            session.flush()
+            position_id = position.id
+            
+            return position_id
+            
+        except Exception as e:
+            logger.error(f"Error creating position atomically: {e}")
+            raise
     
     def close(self):
         """Close database connections with error handling"""

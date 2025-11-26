@@ -1,8 +1,12 @@
 import logging
 import os
 import re
+import time
+import threading
+from collections import defaultdict
 from logging.handlers import RotatingFileHandler
 from datetime import datetime
+from typing import Dict, Optional
 
 def mask_token(token: str) -> str:
     if not token or not isinstance(token, str):
@@ -102,3 +106,116 @@ def setup_logger(name='TradingBot', log_dir='logs', level=None):
     logger.addHandler(console_handler)
     
     return logger
+
+
+class RateLimitedLogger:
+    """
+    Rate-limited logger untuk mencegah log spam pada high-frequency signals.
+    Membatasi jumlah log message yang sama dalam window waktu tertentu.
+    """
+    
+    def __init__(self, logger: logging.Logger, 
+                 max_similar_logs: int = 10,
+                 window_seconds: float = 60.0):
+        """
+        Args:
+            logger: Logger instance yang akan di-wrap
+            max_similar_logs: Max jumlah log yang sama per window
+            window_seconds: Window waktu dalam detik
+        """
+        self.logger = logger
+        self.max_similar_logs = max_similar_logs
+        self.window_seconds = window_seconds
+        self._log_counts: Dict[str, list] = defaultdict(list)
+        self._lock = threading.Lock()
+        self._suppressed_counts: Dict[str, int] = defaultdict(int)
+    
+    def _get_message_key(self, message: str) -> str:
+        """Generate key dari message untuk rate limiting"""
+        key_parts = message[:100] if len(message) > 100 else message
+        key_parts = re.sub(r'\d+\.?\d*', 'NUM', key_parts)
+        key_parts = re.sub(r'0x[0-9a-fA-F]+', 'HEX', key_parts)
+        return key_parts
+    
+    def _should_log(self, message: str) -> bool:
+        """Check apakah message boleh di-log"""
+        with self._lock:
+            now = time.time()
+            key = self._get_message_key(message)
+            
+            self._log_counts[key] = [
+                t for t in self._log_counts[key] 
+                if now - t < self.window_seconds
+            ]
+            
+            if len(self._log_counts[key]) >= self.max_similar_logs:
+                self._suppressed_counts[key] += 1
+                return False
+            
+            self._log_counts[key].append(now)
+            
+            if self._suppressed_counts[key] > 0:
+                suppressed = self._suppressed_counts[key]
+                self._suppressed_counts[key] = 0
+                self.logger.info(f"[Rate Limiter] Suppressed {suppressed} similar messages")
+            
+            return True
+    
+    def debug(self, message: str, *args, **kwargs):
+        if self._should_log(message):
+            self.logger.debug(message, *args, **kwargs)
+    
+    def info(self, message: str, *args, **kwargs):
+        if self._should_log(message):
+            self.logger.info(message, *args, **kwargs)
+    
+    def warning(self, message: str, *args, **kwargs):
+        if self._should_log(message):
+            self.logger.warning(message, *args, **kwargs)
+    
+    def error(self, message: str, *args, **kwargs):
+        self.logger.error(message, *args, **kwargs)
+    
+    def critical(self, message: str, *args, **kwargs):
+        self.logger.critical(message, *args, **kwargs)
+    
+    def exception(self, message: str, *args, **kwargs):
+        self.logger.exception(message, *args, **kwargs)
+    
+    def get_stats(self) -> Dict:
+        """Dapatkan statistik rate limiting"""
+        with self._lock:
+            return {
+                'tracked_message_types': len(self._log_counts),
+                'total_suppressed': sum(self._suppressed_counts.values()),
+                'window_seconds': self.window_seconds,
+                'max_similar_logs': self.max_similar_logs
+            }
+    
+    def clear_stats(self):
+        """Reset statistik rate limiting"""
+        with self._lock:
+            self._log_counts.clear()
+            self._suppressed_counts.clear()
+
+
+def setup_rate_limited_logger(name: str = 'TradingBot', 
+                              log_dir: str = 'logs',
+                              level: Optional[int] = None,
+                              max_similar_logs: int = 10,
+                              window_seconds: float = 60.0) -> RateLimitedLogger:
+    """
+    Setup logger dengan rate limiting untuk mencegah log spam.
+    
+    Args:
+        name: Nama logger
+        log_dir: Direktori log
+        level: Log level
+        max_similar_logs: Max log yang sama per window
+        window_seconds: Window waktu
+        
+    Returns:
+        RateLimitedLogger instance
+    """
+    base_logger = setup_logger(name, log_dir, level)
+    return RateLimitedLogger(base_logger, max_similar_logs, window_seconds)
