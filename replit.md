@@ -70,11 +70,40 @@ The bot's architecture is modular, designed for scalability and maintainability.
 - **Sentry:** For advanced error tracking and monitoring (optional).
 
 ## Recent Changes (2025-11-26)
+### Bot Type Changes
 - **Converted to Private Bot:** Removed premium/subscription system, now uses AUTHORIZED_USER_IDS (admin) and ID_USER_PUBLIC (public users) for access control
 - **Removed Commands:** /langganan, /premium, /beli, /addpremium (no longer applicable)
 - **Simplified User Manager:** Removed is_premium, upgrade_subscription, get_subscription_status, extend_subscription functions
 - **Updated Messages:** All access denied messages now indicate private bot status instead of subscription prompts
-- **Two-Phase Anti-Duplicate Signal Cache:** Implemented race-condition-safe signal deduplication with pending→confirmed status transitions and automatic rollback
-- **Optimized Chart Cleanup for Koyeb:** Reduced max charts from 30 to 10, cleanup interval from 10 to 5 minutes, auto-delete charts older than 30 minutes
-- **Async Lock Protection:** Single `asyncio.Lock()` guards all cache operations (`_check_and_set_pending`, `_confirm_signal_sent`, `_rollback_signal_cache`, `_clear_signal_cache`)
-- **Session End Cleanup:** Signal cache automatically cleared via async method when signal session ends
+
+### Race Condition Fixes
+- **Signal Session Manager:** Enhanced locking with separate `_session_lock` and `_event_lock` to prevent deadlocks
+- **Event Emission Outside Lock:** `_emit_event_outside_lock()` method emits events after releasing session lock
+- **Two-Phase Anti-Duplicate Signal Cache:** Implemented pending→confirmed status transitions and automatic rollback
+
+### Memory Leak Fixes
+- **Chart Generator ThreadPool:** Proper shutdown with pending charts cleanup and tracking
+- **Dashboard Auto-Cleanup:** Background task with stale dashboard detection and removal
+- **Signal Cache Cleanup:** Background task for expired entries removal with `_cleanup_tasks_running` flag
+
+### Database Improvements
+- **Transaction Isolation:** Added `transaction_scope()` and `serializable_transaction()` context managers
+- **Atomic Operations:** `atomic_create_trade()` and `atomic_create_position()` methods
+
+### Logger Enhancements
+- **Rate Limiting:** `RateLimitedLogger` class prevents log spam with configurable windows
+- **Buffer Cleanup:** Automatic cleanup of old log entries to prevent memory growth
+
+### OOM Graceful Degradation
+- **Memory Monitoring:** `check_memory_status()` with fallback to resource module if psutil unavailable
+- **Threshold Configuration:** `MEMORY_WARNING_THRESHOLD_MB` (400) and `MEMORY_CRITICAL_THRESHOLD_MB` (450)
+- **Adaptive Settings:** `get_adjusted_settings()` returns reduced settings when memory critical
+
+### Enhanced Health Check
+- **Comprehensive Stats:** Memory status, cache stats, chart stats, open position count
+- **Degraded Mode Detection:** Automatically reports degraded mode when memory critical
+- **Free Tier Optimization:** Optimized for Koyeb free tier with aggressive cleanup
+
+### Background Tasks Integration
+- **Startup:** Background cleanup tasks started after Telegram bot initialization
+- **Shutdown:** Proper cancellation and cleanup of background tasks before shutdown
