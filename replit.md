@@ -25,10 +25,10 @@ The bot's architecture is modular, designed for scalability and maintainability.
 - **Telegram Bot:** Manages command handling and notifications.
 - **Chart Generator:** Creates professional charts with integrated technical indicators.
 - **Risk Manager:** Calculates lot sizes, P/L, and enforces per-user risk limits (e.g., fixed SL, dynamic TP, daily loss limit, signal cooldown).
-- **Database:** SQLite for persistent data, with PostgreSQL support and auto-migration.
-- **User Manager:** Handles user authentication and access control via AUTHORIZED_USER_IDS and ID_USER_PUBLIC.
-- **Resilience:** Implements CircuitBreaker for WebSocket, global rate limiting for Telegram API, and retry mechanisms.
-- **System Health:** Includes port conflict detection, bot instance locking, and Sentry integration.
+- **Database:** SQLite for persistent data, with PostgreSQL support and auto-migration, featuring connection pooling and robust transaction management.
+- **User Manager:** Handles user authentication and access control via AUTHORIZED_USER_IDS and ID_USER_PUBLIC, with thread-safe concurrent updates.
+- **Resilience:** Implements CircuitBreaker for WebSocket, global rate limiting for Telegram API, retry mechanisms, and advanced WebSocket recovery with exponential backoff.
+- **System Health:** Includes port conflict detection, bot instance locking, Sentry integration, comprehensive health checks, and OOM graceful degradation.
 
 **UI/UX Decisions:**
 - Telegram serves as the primary user interface.
@@ -38,25 +38,18 @@ The bot's architecture is modular, designed for scalability and maintainability.
 - All timestamps are displayed in WIB (Asia/Jakarta) timezone.
 
 **Technical Implementations & Feature Specifications:**
-- **Indicators:** EMA (5, 10, 20, 50), RSI (14 with 20-bar history), Stochastic (K=14, D=3), ATR (14), MACD (12,26,9), Volume, Twin Range Filter, Market Bias CEREBR.
+- **Indicators:** EMA (5, 10, 20, 50), RSI (14 with 20-bar history), Stochastic (K=14, D=3), ATR (14), MACD (12,26,9), Volume, Twin Range Filter, Market Bias CEREBR. Includes NaN/Inf/Negative price handling and robust validation.
 - **Risk Management:** Fixed SL ($1 per trade), dynamic TP (1.45x-2.50x R:R), max spread (5 pips), signal cooldown (120s per user), daily loss limit (3% per user), risk per trade (0.5%). Includes dynamic SL tightening and trailing stop activation.
 - **Access Control:** Private bot with dual-tier access (AUTHORIZED_USER_IDS for admins, ID_USER_PUBLIC for public users).
-- **Admin Commands:** `/riset`, `/status`, `/tasks`, `/analytics`, `/systemhealth`.
-- **User Commands:** `/start`, `/help`, `/monitor`, `/getsignal`, `/status`, `/riwayat`, `/performa`.
-- **Anti-Duplicate Protection:** Two-phase cache pattern for race-condition-safe signal deduplication:
-  - **Phase 1 (pending):** Atomically check duplicate and set pending status with `_cache_lock`
-  - **Phase 2 (confirmed):** Upgrade to confirmed status only after Telegram send succeeds
-  - **Rollback:** Remove pending entry on failure via `_rollback_signal_cache`
-  - Hash-based tracking: `_generate_signal_hash` creates unique identifiers (user_id + direction + price_bucket)
-  - Thread-safe: Single `asyncio.Lock()` protects all cache operations
-  - Session cleanup: Cache cleared via `_clear_signal_cache` when signal session ends
-  - Expiry: 120 seconds, 10 pips price tolerance for similar prices
+- **Commands:** Admin commands (`/riset`, `/status`, `/tasks`, `/analytics`, `/systemhealth`) and User commands (`/start`, `/help`, `/monitor`, `/getsignal`, `/status`, `/riwayat`, `/performa`).
+- **Anti-Duplicate Protection:** Two-phase cache pattern (pending/confirmed status, hash-based tracking, thread-safe locking, TTL-backed signal cache with async cleanup) for race-condition-safe signal deduplication and chart cleanup.
 - **Candle Data Persistence:** Stores M1 and M5 candles in the database for instant bot readiness on restart.
-- **Chart Generation:** Uses `mplfinance` and `matplotlib` for multi-panel charts, configured for headless operation. Charts are automatically deleted upon signal session end, with aggressive cleanup task every 5 minutes (max 10 files, charts older than 30 minutes auto-deleted for Koyeb free tier optimization).
+- **Chart Generation:** Uses `mplfinance` and `matplotlib` for multi-panel charts, configured for headless operation, with configurable timeouts and proper thread cleanup. Charts are automatically deleted upon signal session end with aggressive cleanup.
 - **Multi-User Support:** Implements per-user position tracking and risk management.
-- **Deployment:** Optimized for Koyeb and Replit, featuring an HTTP server for health checks and webhooks. Includes `FREE_TIER_MODE` for reduced resource usage and aggressive startup timeout.
-- **Performance Optimization:** Global signal cooldown (3.0s), tick throttling (3.0s), position monitoring early exit, and optimized Telegram timeout handling. Dashboard update interval is 5 seconds. Exit notifications send TEXT ONLY for faster delivery.
-- **Photo Deduplication:** A `photo_sent` flag in `SignalSession` prevents duplicate photo sending during retries/timeouts.
+- **Deployment:** Optimized for Koyeb and Replit, featuring an HTTP server for health checks and webhooks, and `FREE_TIER_MODE` for resource efficiency.
+- **Performance Optimization:** Global signal cooldown (3.0s), tick throttling (3.0s), position monitoring early exit, optimized Telegram timeout handling, and fast text-only exit notifications.
+- **Logging & Error Handling:** Rate-limited logging, log rotation, type-safe indicator computations, and comprehensive exception handling with categorization for critical errors and deprecated API compatibility.
+- **Task Management:** Centralized task registry with shielded cancellation for graceful shutdown, background task callbacks, and stale task detection.
 
 ## External Dependencies
 - **Deriv WebSocket API:** For real-time XAUUSD market data.
@@ -68,130 +61,3 @@ The bot's architecture is modular, designed for scalability and maintainability.
 - **aiohttp:** For asynchronous HTTP server and client operations.
 - **python-dotenv:** For managing environment variables.
 - **Sentry:** For advanced error tracking and monitoring (optional).
-
-## Recent Changes (2025-11-26)
-### Bot Type Changes
-- **Converted to Private Bot:** Removed premium/subscription system, now uses AUTHORIZED_USER_IDS (admin) and ID_USER_PUBLIC (public users) for access control
-- **Removed Commands:** /langganan, /premium, /beli, /addpremium (no longer applicable)
-- **Simplified User Manager:** Removed is_premium, upgrade_subscription, get_subscription_status, extend_subscription functions
-- **Updated Messages:** All access denied messages now indicate private bot status instead of subscription prompts
-
-### Race Condition Fixes
-- **Signal Session Manager:** Enhanced locking with separate `_session_lock` and `_event_lock` to prevent deadlocks
-- **Event Emission Outside Lock:** `_emit_event_outside_lock()` method emits events after releasing session lock
-- **Two-Phase Anti-Duplicate Signal Cache:** Implemented pending→confirmed status transitions and automatic rollback
-
-### Memory Leak Fixes
-- **Chart Generator ThreadPool:** Proper shutdown with pending charts cleanup and tracking
-- **Dashboard Auto-Cleanup:** Background task with stale dashboard detection and removal
-- **Signal Cache Cleanup:** Background task for expired entries removal with `_cleanup_tasks_running` flag
-
-### Database Improvements
-- **Transaction Isolation:** Added `transaction_scope()` and `serializable_transaction()` context managers
-- **Atomic Operations:** `atomic_create_trade()` and `atomic_create_position()` methods
-
-### Logger Enhancements
-- **Rate Limiting:** `RateLimitedLogger` class prevents log spam with configurable windows
-- **Buffer Cleanup:** Automatic cleanup of old log entries to prevent memory growth
-
-### OOM Graceful Degradation
-- **Memory Monitoring:** `check_memory_status()` with fallback to resource module if psutil unavailable
-- **Threshold Configuration:** `MEMORY_WARNING_THRESHOLD_MB` (400) and `MEMORY_CRITICAL_THRESHOLD_MB` (450)
-- **Adaptive Settings:** `get_adjusted_settings()` returns reduced settings when memory critical
-
-### Enhanced Health Check
-- **Comprehensive Stats:** Memory status, cache stats, chart stats, open position count
-- **Degraded Mode Detection:** Automatically reports degraded mode when memory critical
-- **Free Tier Optimization:** Optimized for Koyeb free tier with aggressive cleanup
-
-### Background Tasks Integration
-- **Startup:** Background cleanup tasks started after Telegram bot initialization
-- **Shutdown:** Proper cancellation and cleanup of background tasks before shutdown
-
-## Latest Improvements (2025-11-26 - Hardening Update)
-
-### CRITICAL Priority Fixes
-
-#### bot/telegram_bot.py - Signal Cache & Chart Cleanup
-- **TTL-backed Signal Cache:** Implemented time decay with different TTLs for pending (60s) vs confirmed (120s) entries
-- **Async Cleanup Sweeper:** Background task `_pending_chart_cleanup_loop()` for automatic cleanup
-- **Telemetry Counters:** Added `_cache_telemetry` tracking hits, misses, rollbacks, expired cleanups
-- **Pending Chart Eviction:** Added `register_pending_chart()`, `confirm_chart_sent()`, `evict_pending_chart()` methods
-- **Chart Integration:** Registered eviction callbacks with SignalSessionManager and ChartGenerator
-
-#### bot/market_data.py - WebSocket Recovery & NaN Handling
-- **Connection State Machine:** Added `ConnectionState` enum (DISCONNECTED, CONNECTING, CONNECTED, RECONNECTING)
-- **Exponential Backoff with Jitter:** Decorrelated jitter algorithm for better distribution
-- **ConnectionMetrics:** Tracking connections, reconnects, durations, state transition history
-- **Pub/Sub Cleanup:** Added `cleanup_stale_subscribers()` and `_unsubscribe_all()` methods
-- **NaN Scrubbing:** Added `is_valid_price()`, `sanitize_price_data()`, `_scrub_nan_prices()` at all boundaries
-
-#### main.py - Graceful Shutdown & Task Registry
-- **Task Registry:** Added `TaskInfo`, `TaskPriority`, `TaskStatus` for tracking all long-lived tasks
-- **Shielded Cancellation:** `_cancel_task_with_shield()` for critical tasks during shutdown
-- **Proper Shutdown Sequence:** MarketData → Telegram → Scheduler → PositionTracker → HTTPServer → DB
-- **Signal Handlers:** Thread-safe double-shutdown prevention with force exit after 3 signals
-
-### HIGH Priority Fixes
-
-#### bot/position_tracker.py - Task Lifecycle Tracking
-- **Completion Event:** Added `_completion_event` (asyncio.Event) for tracking task completion
-- **Wait for Completion:** `wait_for_completion(timeout)` method to wait for all pending tasks
-- **Done Callbacks:** `_on_task_done()` drains exceptions and resolves SignalSessionManager states
-
-#### bot/task_scheduler.py - Background Task Callbacks
-- **Exception Draining:** `_on_task_done()` callback for exception logging
-- **Flush Pending Tasks:** `flush_pending_tasks(timeout=15)` for graceful shutdown
-- **Task Tracking:** Added `_task_exceptions` dict to track exceptions across task lifecycle
-
-#### bot/database.py - Connection Pooling & Rollback Safety
-- **QueuePool Configuration:** POOL_SIZE=5, MAX_OVERFLOW=10, POOL_TIMEOUT=30, POOL_RECYCLE=3600
-- **Pool Event Listeners:** Monitoring checkout, checkin, connect, close events
-- **Safe Session:** `safe_session()` context manager with guaranteed rollback and closure
-- **Pool Status:** `get_pool_status()` and `log_pool_status()` for monitoring
-
-#### bot/user_manager.py - Thread-Safe Concurrent Updates
-- **Per-User Locks:** `_user_locks: Dict[int, RLock]` via defaultdict
-- **Lock Context Manager:** `user_lock(telegram_id)` for clean lock handling
-- **Active Users Guard:** `_active_users_lock` for mutations
-- **Stale Lock Cleanup:** `clear_stale_locks()` for memory management
-
-### MEDIUM Priority Fixes
-
-#### bot/strategy.py - NaN/Inf/Negative Price Handling
-- **PriceDataValidator:** Centralized safe_number pipeline
-- **ValidationResult:** Dataclass for validation results
-- **validate_price_data():** Helper for OHLCV validation with short-circuit
-
-#### bot/utils.py - Recursive Depth Limits & LRU Cache
-- **RecursionGuard:** Helper class with max depth counters and thread-safety
-- **TunedLRUCache:** Class with size/time metrics and eviction logging
-- **@with_recursion_guard:** Decorator for easy function protection
-
-#### bot/error_handler.py - Exception Categorization
-- **ErrorContext:** Rich context class with traceback capture
-- **ExceptionCategory:** 20+ categories with pattern mappings
-- **Structured Payloads:** `to_dict()` and `to_structured_payload()` for serialization
-
-#### bot/alert_system.py - History Cleanup & Queue Persistence
-- **Queue Persistence:** `save_queue_state()` and `restore_queue_state()` via JSON
-- **Rate Limiter State:** Serialization for surviving resets
-- **Periodic Cleanup:** `periodic_history_cleanup_with_backoff()` with exponential backoff
-
-### LOW Priority Fixes
-
-#### bot/indicators.py - Null Check Safety
-- **validate_series():** Validates and sanitizes pandas Series
-- **safe_divide():** Handles division by zero and NaN
-- **_validate_dataframe():** Validates DataFrame columns and data
-
-#### config.py - Configuration Validation Strictness
-- **ConfigError:** Enhanced exception with errors/warnings lists
-- **Validation Helpers:** `_validate_type()`, `_validate_range()`, `_validate_positive()`, etc.
-- **Strict Mode:** `validate(strict=True)` for comprehensive checks
-
-#### bot/logger.py - Log Rotation & Disk Cleanup
-- **Retention Policy:** 5MB per file, 5 backups, 7 days retention
-- **Module-Specific Config:** LOG_CONFIG with custom settings per module
-- **cleanup_old_logs():** Removes old, empty, and excess backup files
-- **get_log_statistics():** Returns detailed log file statistics
