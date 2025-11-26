@@ -44,9 +44,16 @@ The bot's architecture is modular, designed for scalability and maintainability.
 - **Subscription System:** Weekly and Monthly premium packages with automatic expiry.
 - **Admin Commands:** `/riset`, `/addpremium`, `/status`, `/tasks`, `/analytics`, `/systemhealth`.
 - **User Commands:** `/premium`, `/beli`, `/langganan`.
-- **Anti-Duplicate Protection:** Prevents new signals if an active position exists, enhanced with price + direction tracking and 5 pips tolerance.
+- **Anti-Duplicate Protection:** Two-phase cache pattern for race-condition-safe signal deduplication:
+  - **Phase 1 (pending):** Atomically check duplicate and set pending status with `_cache_lock`
+  - **Phase 2 (confirmed):** Upgrade to confirmed status only after Telegram send succeeds
+  - **Rollback:** Remove pending entry on failure via `_rollback_signal_cache`
+  - Hash-based tracking: `_generate_signal_hash` creates unique identifiers (user_id + direction + price_bucket)
+  - Thread-safe: Single `asyncio.Lock()` protects all cache operations
+  - Session cleanup: Cache cleared via `_clear_signal_cache` when signal session ends
+  - Expiry: 120 seconds, 10 pips price tolerance for similar prices
 - **Candle Data Persistence:** Stores M1 and M5 candles in the database for instant bot readiness on restart.
-- **Chart Generation:** Uses `mplfinance` and `matplotlib` for multi-panel charts, configured for headless operation. Charts are automatically deleted upon signal session end, with an aggressive cleanup task every 10 minutes (max 30 files for Koyeb free tier).
+- **Chart Generation:** Uses `mplfinance` and `matplotlib` for multi-panel charts, configured for headless operation. Charts are automatically deleted upon signal session end, with aggressive cleanup task every 5 minutes (max 10 files, charts older than 30 minutes auto-deleted for Koyeb free tier optimization).
 - **Multi-User Support:** Implements per-user position tracking and risk management.
 - **Deployment:** Optimized for Koyeb and Replit, featuring an HTTP server for health checks and webhooks. Includes `FREE_TIER_MODE` for reduced resource usage and aggressive startup timeout.
 - **Performance Optimization:** Global signal cooldown (3.0s), tick throttling (3.0s), position monitoring early exit, and optimized Telegram timeout handling. Dashboard update interval is 5 seconds. Exit notifications send TEXT ONLY for faster delivery.
@@ -62,3 +69,9 @@ The bot's architecture is modular, designed for scalability and maintainability.
 - **aiohttp:** For asynchronous HTTP server and client operations.
 - **python-dotenv:** For managing environment variables.
 - **Sentry:** For advanced error tracking and monitoring (optional).
+
+## Recent Changes (2025-11-26)
+- **Two-Phase Anti-Duplicate Signal Cache:** Implemented race-condition-safe signal deduplication with pending→confirmed status transitions and automatic rollback
+- **Optimized Chart Cleanup for Koyeb:** Reduced max charts from 30 to 10, cleanup interval from 10 to 5 minutes, auto-delete charts older than 30 minutes
+- **Async Lock Protection:** Single `asyncio.Lock()` guards all cache operations (`_check_and_set_pending`, `_confirm_signal_sent`, `_rollback_signal_cache`, `_clear_signal_cache`)
+- **Session End Cleanup:** Signal cache automatically cleared via async method when signal session ends

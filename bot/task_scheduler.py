@@ -385,31 +385,42 @@ def setup_default_tasks(scheduler: TaskScheduler, bot_components: Dict):
         if chart_generator:
             import os
             chart_dir = chart_generator.chart_dir
-            max_charts = 30  # Maximum charts untuk Koyeb free tier
+            max_charts = 10  # Maximum charts untuk Koyeb free tier (optimized)
+            max_age_minutes = 30  # Hapus chart lebih dari 30 menit
             
             try:
                 if os.path.exists(chart_dir):
-                    files = sorted(
-                        [f for f in os.listdir(chart_dir) if f.endswith('.png')],
-                        key=lambda x: os.path.getmtime(os.path.join(chart_dir, x))
-                    )
+                    import time
+                    current_time = time.time()
+                    files = []
                     
-                    if len(files) > max_charts:
-                        files_to_delete = files[:len(files) - max_charts]
-                        for f in files_to_delete:
+                    for f in os.listdir(chart_dir):
+                        if f.endswith('.png'):
+                            file_path = os.path.join(chart_dir, f)
+                            file_age_minutes = (current_time - os.path.getmtime(file_path)) / 60
+                            files.append((f, file_path, file_age_minutes))
+                    
+                    files.sort(key=lambda x: x[2], reverse=True)
+                    
+                    deleted_count = 0
+                    for f, file_path, age in files:
+                        if age > max_age_minutes or len(files) - deleted_count > max_charts:
                             try:
-                                os.remove(os.path.join(chart_dir, f))
-                                logger.debug(f"Deleted excess chart: {f}")
+                                os.remove(file_path)
+                                deleted_count += 1
+                                logger.debug(f"Deleted chart: {f} (age: {age:.1f}min)")
                             except Exception as e:
                                 logger.warning(f"Failed to delete chart {f}: {e}")
-                        logger.info(f"Aggressive cleanup: removed {len(files_to_delete)} old charts")
+                    
+                    if deleted_count > 0:
+                        logger.info(f"Aggressive cleanup: removed {deleted_count} old charts")
             except Exception as e:
                 logger.error(f"Error in aggressive chart cleanup: {e}")
     
     scheduler.add_interval_task(
         'aggressive_chart_cleanup',
         aggressive_chart_cleanup,
-        interval_seconds=600  # 10 menit
+        interval_seconds=300  # 5 menit untuk Koyeb free tier
     )
     
     scheduler.add_daily_task(

@@ -218,6 +218,12 @@ class TradingBot:
         self.tick_throttle_seconds = 3.0  # Minimum interval between signal checks (match global cooldown)
         logger.info(f"✅ Optimized signal detection: global_cooldown={self.global_signal_cooldown}s, tick_throttle={self.tick_throttle_seconds}s")
         
+        self.sent_signals_cache: Dict[str, Dict[str, any]] = {}
+        self.signal_cache_expiry_seconds = 120
+        self.signal_price_tolerance_pips = 10.0
+        self._cache_lock = asyncio.Lock()
+        logger.info("✅ Two-phase anti-duplicate signal cache initialized (pending→confirmed)")
+        
         import os
         self.instance_lock_file = os.path.join('data', '.bot_instance.lock')
         os.makedirs('data', exist_ok=True)
@@ -235,6 +241,69 @@ class TradingBot:
             user = self.user_manager.get_user(user_id)
             return user.is_admin if user else False
         return user_id in self.config.AUTHORIZED_USER_IDS
+    
+    def _generate_signal_hash(self, user_id: int, signal_type: str, entry_price: float) -> str:
+        price_bucket = round(entry_price / (self.signal_price_tolerance_pips / self.config.XAUUSD_PIP_VALUE))
+        return f"{user_id}_{signal_type}_{price_bucket}"
+    
+    async def _check_and_set_pending(self, user_id: int, signal_type: str, entry_price: float) -> bool:
+        """Check for duplicate and set pending status atomically. Returns True if signal can proceed."""
+        async with self._cache_lock:
+            now = datetime.now()
+            cache_copy = dict(self.sent_signals_cache)
+            
+            expired_keys = [
+                k for k, v in cache_copy.items() 
+                if (now - v['timestamp']).total_seconds() > self.signal_cache_expiry_seconds
+            ]
+            for k in expired_keys:
+                self.sent_signals_cache.pop(k, None)
+            
+            signal_hash = self._generate_signal_hash(user_id, signal_type, entry_price)
+            
+            cached = self.sent_signals_cache.get(signal_hash)
+            if cached:
+                status = cached.get('status', 'confirmed')
+                time_since = (now - cached['timestamp']).total_seconds()
+                logger.debug(f"Duplicate signal blocked: {signal_hash}, status={status}, {time_since:.1f}s ago")
+                return False
+            
+            self.sent_signals_cache[signal_hash] = {
+                'status': 'pending',
+                'timestamp': now
+            }
+            logger.debug(f"Signal marked as pending: {signal_hash}")
+            return True
+    
+    async def _confirm_signal_sent(self, user_id: int, signal_type: str, entry_price: float):
+        """Confirm signal was sent successfully - upgrade from pending to confirmed."""
+        async with self._cache_lock:
+            signal_hash = self._generate_signal_hash(user_id, signal_type, entry_price)
+            if signal_hash in self.sent_signals_cache:
+                self.sent_signals_cache[signal_hash]['status'] = 'confirmed'
+                self.sent_signals_cache[signal_hash]['timestamp'] = datetime.now()
+                logger.debug(f"Signal confirmed: {signal_hash}")
+    
+    async def _rollback_signal_cache(self, user_id: int, signal_type: str, entry_price: float):
+        """Remove pending signal entry on failure."""
+        async with self._cache_lock:
+            signal_hash = self._generate_signal_hash(user_id, signal_type, entry_price)
+            removed = self.sent_signals_cache.pop(signal_hash, None)
+            if removed:
+                logger.debug(f"Signal cache rolled back: {signal_hash}")
+    
+    async def _clear_signal_cache(self, user_id: int = None):
+        """Clear signal cache for user or all users."""
+        async with self._cache_lock:
+            if user_id:
+                cache_keys = list(self.sent_signals_cache.keys())
+                for k in cache_keys:
+                    if k.startswith(f"{user_id}_"):
+                        self.sent_signals_cache.pop(k, None)
+                logger.debug(f"Cleared signal cache for user {user_id}")
+            else:
+                self.sent_signals_cache.clear()
+                logger.debug("Cleared all signal cache")
     
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
@@ -691,6 +760,15 @@ class TradingBot:
                 logger.error(f"Signal missing required fields: {missing_fields}")
                 return
             
+            can_proceed = await self._check_and_set_pending(user_id, signal['signal'], signal['entry_price'])
+            if not can_proceed:
+                logger.warning(f"🚫 Duplicate signal blocked for user {mask_user_id(user_id)}: {signal['signal']} @${signal['entry_price']:.2f}")
+                return
+            
+            signal_sent_successfully = False
+            signal_type = signal['signal']
+            entry_price = signal['entry_price']
+            
             session = self.db.get_session()
             trade_id = None
             position_id = None
@@ -701,9 +779,9 @@ class TradingBot:
                 trade = Trade(
                     user_id=user_id,
                     ticker='XAUUSD',
-                    signal_type=signal['signal'],
+                    signal_type=signal_type,
                     signal_source=signal_source,
-                    entry_price=signal['entry_price'],
+                    entry_price=entry_price,
                     stop_loss=signal['stop_loss'],
                     take_profit=signal['take_profit'],
                     timeframe=signal['timeframe'],
@@ -715,33 +793,23 @@ class TradingBot:
                 
                 logger.debug(f"Trade created in DB with ID {trade_id}, preparing to add position...")
                 
-            except Exception as e:
-                logger.error(f"Database error creating trade: {e}")
-                session.rollback()
-                session.close()
-                raise
-            
-            try:
                 position_id = await self.position_tracker.add_position(
                     user_id,
                     trade_id,
-                    signal['signal'],
-                    signal['entry_price'],
+                    signal_type,
+                    entry_price,
                     signal['stop_loss'],
                     signal['take_profit']
                 )
                 
                 if not position_id:
-                    logger.error(f"Position creation failed for trade {trade_id}")
-                    session.rollback()
-                    session.close()
                     raise ValueError("Failed to create position in position tracker")
                 
                 session.commit()
                 logger.debug(f"✅ Database committed - Trade:{trade_id} Position:{position_id}")
                 
             except Exception as e:
-                logger.error(f"Error adding position: {type(e).__name__}: {e}")
+                logger.error(f"DB/Position error: {type(e).__name__}: {e}")
                 session.rollback()
                 raise
             finally:
@@ -816,7 +884,9 @@ class TradingBot:
                     else:
                         logger.debug(f"Skipping chart - insufficient candles ({len(df) if df is not None else 0}/30)")
                 
-                logger.info(f"✅ Signal sent - Trade:{trade_id} Position:{position_id} User:{mask_user_id(user_id)} {signal['signal']} @${signal['entry_price']:.2f}")
+                signal_sent_successfully = True
+                await self._confirm_signal_sent(user_id, signal_type, entry_price)
+                logger.info(f"✅ Signal sent - Trade:{trade_id} Position:{position_id} User:{mask_user_id(user_id)} {signal_type} @${entry_price:.2f}")
                 
                 if signal_message and signal_message.message_id:
                     await self.start_dashboard(user_id, chat_id, position_id, signal_message.message_id)
@@ -825,9 +895,14 @@ class TradingBot:
                 logger.error(f"Validation error in signal processing: {e}")
             except Exception as e:
                 logger.error(f"Error in signal processing: {type(e).__name__}: {e}", exc_info=True)
+            finally:
+                if not signal_sent_successfully:
+                    await self._rollback_signal_cache(user_id, signal_type, entry_price)
+                    logger.debug(f"Signal cache rolled back after failure for user {mask_user_id(user_id)}")
             
         except Exception as e:
             logger.error(f"Critical error sending signal: {type(e).__name__}: {e}", exc_info=True)
+            await self._rollback_signal_cache(user_id, signal['signal'], signal['entry_price'])
             if self.error_handler:
                 self.error_handler.log_exception(e, "send_signal")
             if self.alert_system:
@@ -843,8 +918,13 @@ class TradingBot:
         """Handler untuk event on_session_end dari SignalSessionManager"""
         try:
             user_id = session.user_id
-            logger.info(f"Session ended for user {mask_user_id(user_id)}, stopping dashboard if active")
+            logger.info(f"Session ended for user {mask_user_id(user_id)}, stopping dashboard and cleaning up cache")
+            
             await self.stop_dashboard(user_id)
+            
+            await self._clear_signal_cache(user_id)
+            logger.info(f"✅ Signal cache cleared for user {mask_user_id(user_id)} after session end")
+            
         except Exception as e:
             logger.error(f"Error in session end handler: {e}")
     
