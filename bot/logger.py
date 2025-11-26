@@ -484,7 +484,7 @@ def setup_rate_limited_logger(name: str = 'TradingBot',
 
 def schedule_log_cleanup(log_dir: str = 'logs',
                          interval_hours: int = 24,
-                         retention_days: int = None) -> threading.Thread:
+                         retention_days: Optional[int] = None) -> threading.Thread:
     """
     Schedule periodic log cleanup in a background thread.
     

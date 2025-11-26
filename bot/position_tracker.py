@@ -1,7 +1,9 @@
 import asyncio
+import traceback
 from collections import defaultdict
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Dict, Optional, Tuple, Set, Callable, Any
+from typing import Dict, Optional, Tuple, Set, Callable, Any, List
 import pytz
 from telegram.error import TimedOut
 from bot.logger import setup_logger
@@ -15,6 +17,34 @@ NOTIFICATION_TIMEOUT = 10.0
 FALLBACK_NOTIFICATION_TIMEOUT = 5.0
 TICK_QUEUE_TIMEOUT = 5.0
 TASK_CLEANUP_TIMEOUT = 10.0
+LONG_RUNNING_TASK_THRESHOLD = 60.0
+TASK_AUTO_CANCEL_THRESHOLD = 300.0
+SLOW_TASK_ALERT_COUNT = 3
+TASK_MONITOR_INTERVAL = 30.0
+MAX_EXCEPTION_HISTORY = 100
+
+
+@dataclass
+class TaskExceptionRecord:
+    """Record of a task exception for debugging"""
+    task_name: str
+    exception_type: str
+    exception_message: str
+    traceback_str: str
+    timestamp: datetime = field(default_factory=lambda: datetime.now(pytz.UTC))
+
+
+@dataclass
+class TaskCompletionResult:
+    """Result of wait_for_completion with detailed information"""
+    completed: bool
+    total_tasks: int
+    completed_tasks: int
+    pending_tasks: List[str]
+    timed_out_tasks: List[str]
+    cancelled_tasks: List[str]
+    error_tasks: List[str]
+    elapsed_time: float = 0.0
 
 class PositionError(Exception):
     """Base exception for position tracking errors"""
@@ -101,62 +131,148 @@ class PositionTracker:
         self._shutdown_event = asyncio.Event()
         self._completion_event = asyncio.Event()
         self._monitoring_task: Optional[asyncio.Task] = None
+        self._task_monitor_task: Optional[asyncio.Task] = None
         self._task_callbacks: Dict[str, Callable] = {}
         self._task_results: Dict[str, Any] = {}
+        
+        self._task_start_times: Dict[str, datetime] = {}
+        self._exception_history: List[TaskExceptionRecord] = []
+        self._slow_task_counts: Dict[str, int] = defaultdict(int)
+        self._cancelled_task_names: Set[str] = set()
+        
+        self.long_running_threshold = LONG_RUNNING_TASK_THRESHOLD
+        self.auto_cancel_threshold = TASK_AUTO_CANCEL_THRESHOLD
+        self.slow_task_alert_count = SLOW_TASK_ALERT_COUNT
     
     def _on_task_done(self, task: asyncio.Task, task_name: str = None) -> None:
         """Callback invoked when a tracked task completes.
         
         Handles:
-        - Exception draining and logging
+        - Exception draining and logging with full traceback
         - Task removal from pending set
+        - Exception history tracking for debugging
+        - InvalidStateError graceful handling
         - SignalSessionManager state resolution if applicable
         - Custom callback execution
         """
+        effective_name = task_name or task.get_name()
+        
         try:
             self._pending_tasks.discard(task)
             
+            if effective_name in self._task_start_times:
+                start_time = self._task_start_times.pop(effective_name)
+                elapsed = (datetime.now(pytz.UTC) - start_time).total_seconds()
+                if elapsed > self.long_running_threshold:
+                    logger.warning(f"⏱️ Task {effective_name} took {elapsed:.2f}s to complete (threshold: {self.long_running_threshold}s)")
+                    self._slow_task_counts[effective_name] += 1
+        except Exception as cleanup_err:
+            logger.debug(f"Error during task cleanup: {cleanup_err}")
+        
+        try:
             if task.cancelled():
-                logger.debug(f"Task {task_name or task.get_name()} was cancelled")
+                self._cancelled_task_names.add(effective_name)
+                logger.debug(f"Task {effective_name} was cancelled")
+                self._cleanup_task_state(effective_name)
                 return
+        except asyncio.InvalidStateError as e:
+            logger.debug(f"InvalidStateError checking cancelled state for {effective_name}: {e}")
+            self._cleanup_task_state(effective_name)
+            return
+        
+        exception = None
+        try:
+            exception = task.exception()
+        except asyncio.CancelledError:
+            self._cancelled_task_names.add(effective_name)
+            logger.debug(f"Task {effective_name} was cancelled (detected via CancelledError)")
+            self._cleanup_task_state(effective_name)
+            return
+        except asyncio.InvalidStateError as e:
+            logger.debug(f"InvalidStateError getting exception for {effective_name}: {e}")
+            self._cleanup_task_state(effective_name)
+            return
+        
+        if exception:
+            self._record_exception(effective_name, exception)
             
-            exception = task.exception() if not task.cancelled() else None
-            if exception:
-                logger.error(f"Task {task_name or task.get_name()} raised exception: {exception}", exc_info=exception)
-                if self.alert_system:
-                    try:
-                        asyncio.create_task(
-                            self.alert_system.send_system_error(
-                                f"Task Error: {task_name or task.get_name()}\n"
-                                f"Exception: {type(exception).__name__}: {str(exception)}"
-                            )
+            tb_str = "".join(traceback.format_exception(type(exception), exception, exception.__traceback__))
+            logger.error(
+                f"Task {effective_name} raised exception: {type(exception).__name__}: {exception}\n"
+                f"Traceback:\n{tb_str}"
+            )
+            
+            if self.alert_system:
+                try:
+                    asyncio.create_task(
+                        self.alert_system.send_system_error(
+                            f"⚠️ Task Error: {effective_name}\n"
+                            f"Exception: {type(exception).__name__}: {str(exception)}\n"
+                            f"Check logs for full traceback"
                         )
-                    except Exception as alert_err:
-                        logger.error(f"Failed to send task error alert: {alert_err}")
-            else:
+                    )
+                except Exception as alert_err:
+                    logger.error(f"Failed to send task error alert: {alert_err}")
+        else:
+            try:
                 result = task.result()
                 if task_name:
                     self._task_results[task_name] = result
-                logger.debug(f"Task {task_name or task.get_name()} completed successfully")
+                logger.debug(f"Task {effective_name} completed successfully")
+            except asyncio.CancelledError:
+                self._cancelled_task_names.add(effective_name)
+                logger.debug(f"Task {effective_name} was cancelled (detected via result())")
+            except asyncio.InvalidStateError as e:
+                logger.debug(f"InvalidStateError getting result for {effective_name}: {e}")
+            except Exception as result_err:
+                logger.error(f"Error getting result for {effective_name}: {result_err}")
+        
+        if task_name and task_name in self._task_callbacks:
+            try:
+                callback = self._task_callbacks.pop(task_name)
+                callback(task)
+            except Exception as cb_err:
+                logger.error(f"Task callback error for {task_name}: {cb_err}")
+        
+        self._cleanup_task_state(effective_name)
+        
+        if len(self._pending_tasks) == 0:
+            self._completion_event.set()
+    
+    def _record_exception(self, task_name: str, exception: Exception) -> None:
+        """Record exception in history for debugging"""
+        try:
+            tb_str = "".join(traceback.format_exception(type(exception), exception, exception.__traceback__))
+            record = TaskExceptionRecord(
+                task_name=task_name,
+                exception_type=type(exception).__name__,
+                exception_message=str(exception),
+                traceback_str=tb_str
+            )
+            self._exception_history.append(record)
             
-            if task_name and task_name in self._task_callbacks:
-                try:
-                    callback = self._task_callbacks.pop(task_name)
-                    callback(task)
-                except Exception as cb_err:
-                    logger.error(f"Task callback error for {task_name}: {cb_err}")
-            
-            if len(self._pending_tasks) == 0:
-                self._completion_event.set()
-                
-        except asyncio.InvalidStateError:
-            pass
+            if len(self._exception_history) > MAX_EXCEPTION_HISTORY:
+                self._exception_history = self._exception_history[-MAX_EXCEPTION_HISTORY:]
         except Exception as e:
-            logger.error(f"Error in task done callback: {e}")
+            logger.debug(f"Error recording exception: {e}")
+    
+    def _cleanup_task_state(self, task_name: str) -> None:
+        """Clean up task-related state"""
+        self._task_start_times.pop(task_name, None)
+        self._task_callbacks.pop(task_name, None)
+    
+    def get_exception_history(self, limit: int = 20) -> List[TaskExceptionRecord]:
+        """Get recent exception history for debugging"""
+        return self._exception_history[-limit:]
+    
+    def get_slow_task_stats(self) -> Dict[str, int]:
+        """Get statistics on slow tasks"""
+        return dict(self._slow_task_counts)
     
     def _create_tracked_task(self, coro, name: str = None, 
                              on_complete: Callable = None,
-                             resolve_session_user_id: int = None) -> asyncio.Task:
+                             resolve_session_user_id: int = None,
+                             timeout: float = None) -> asyncio.Task:
         """Create a task and track it for proper cleanup on shutdown.
         
         Args:
@@ -164,26 +280,47 @@ class PositionTracker:
             name: Optional task name for identification
             on_complete: Optional callback when task completes
             resolve_session_user_id: If set, resolve SignalSessionManager for this user on completion
+            timeout: Optional task timeout in seconds (auto-cancels if exceeded)
             
         Returns:
             asyncio.Task: The created and tracked task
         """
-        task = asyncio.create_task(coro, name=name)
+        effective_name = name or f"task_{id(coro)}"
+        
+        if timeout:
+            async def wrapped_coro():
+                try:
+                    return await asyncio.wait_for(coro, timeout=timeout)
+                except asyncio.TimeoutError:
+                    logger.warning(f"⏱️ Task {effective_name} timed out after {timeout}s")
+                    raise
+            task = asyncio.create_task(wrapped_coro(), name=effective_name)
+        else:
+            task = asyncio.create_task(coro, name=effective_name)
+        
         self._pending_tasks.add(task)
         self._completion_event.clear()
         
+        self._task_start_times[effective_name] = datetime.now(pytz.UTC)
+        
         if on_complete:
-            self._task_callbacks[name or task.get_name()] = on_complete
+            self._task_callbacks[effective_name] = on_complete
         
         def done_callback(t: asyncio.Task):
-            self._on_task_done(t, name)
+            self._on_task_done(t, effective_name)
             
             if resolve_session_user_id and self.signal_session_manager:
                 try:
-                    if not t.cancelled() and t.exception() is None:
-                        asyncio.create_task(
-                            self._resolve_session_state(resolve_session_user_id)
-                        )
+                    if not t.cancelled():
+                        exc = None
+                        try:
+                            exc = t.exception()
+                        except (asyncio.CancelledError, asyncio.InvalidStateError):
+                            pass
+                        if exc is None:
+                            asyncio.create_task(
+                                self._resolve_session_state(resolve_session_user_id)
+                            )
                 except Exception as e:
                     logger.error(f"Error resolving session state: {e}")
         
@@ -207,29 +344,105 @@ class PositionTracker:
         except Exception as e:
             logger.error(f"Error resolving session state for user {user_id}: {e}")
     
-    async def wait_for_completion(self, timeout: float = None) -> bool:
-        """Wait for all pending tasks to complete.
+    async def wait_for_completion(self, timeout: float = None, 
+                                   progress_interval: float = 5.0) -> TaskCompletionResult:
+        """Wait for all pending tasks to complete with detailed progress tracking.
         
         Args:
             timeout: Maximum time to wait in seconds. None means wait indefinitely.
+            progress_interval: Interval for logging progress updates.
             
         Returns:
-            bool: True if all tasks completed, False if timeout occurred
+            TaskCompletionResult: Detailed result with completion status and task information
         """
-        if not self._pending_tasks:
-            return True
+        start_time = datetime.now(pytz.UTC)
+        initial_count = len(self._pending_tasks)
         
-        logger.info(f"Waiting for {len(self._pending_tasks)} pending tasks to complete...")
+        if not self._pending_tasks:
+            return TaskCompletionResult(
+                completed=True,
+                total_tasks=0,
+                completed_tasks=0,
+                pending_tasks=[],
+                timed_out_tasks=[],
+                cancelled_tasks=[],
+                error_tasks=[],
+                elapsed_time=0.0
+            )
+        
+        logger.info(f"📊 Waiting for {initial_count} pending tasks to complete...")
+        pending_names_initial = self.get_pending_task_names()
+        
+        async def progress_reporter():
+            """Report progress at intervals"""
+            last_count = initial_count
+            while True:
+                await asyncio.sleep(progress_interval)
+                current_count = len(self._pending_tasks)
+                if current_count != last_count:
+                    completed = initial_count - current_count
+                    logger.info(f"📊 Progress: {completed}/{initial_count} tasks completed, {current_count} remaining")
+                    if current_count > 0:
+                        remaining = self.get_pending_task_names()[:5]
+                        logger.debug(f"   Remaining tasks: {remaining}{'...' if len(self._pending_tasks) > 5 else ''}")
+                    last_count = current_count
+        
+        progress_task = asyncio.create_task(progress_reporter())
+        
+        completed_ok = False
+        timed_out_tasks = []
+        error_tasks = []
         
         try:
             if timeout:
-                await asyncio.wait_for(self._completion_event.wait(), timeout=timeout)
+                try:
+                    await asyncio.wait_for(self._completion_event.wait(), timeout=timeout)
+                    completed_ok = True
+                except asyncio.TimeoutError:
+                    timed_out_tasks = self.get_pending_task_names()
+                    logger.warning(
+                        f"⏰ Timeout after {timeout}s waiting for task completion. "
+                        f"{len(self._pending_tasks)} tasks still pending: {timed_out_tasks[:10]}{'...' if len(timed_out_tasks) > 10 else ''}"
+                    )
             else:
                 await self._completion_event.wait()
-            return True
-        except asyncio.TimeoutError:
-            logger.warning(f"Timeout waiting for task completion. {len(self._pending_tasks)} tasks still pending")
-            return False
+                completed_ok = True
+        finally:
+            progress_task.cancel()
+            try:
+                await progress_task
+            except asyncio.CancelledError:
+                pass
+        
+        elapsed = (datetime.now(pytz.UTC) - start_time).total_seconds()
+        pending_final = self.get_pending_task_names()
+        cancelled = list(self._cancelled_task_names)
+        
+        error_tasks = [record.task_name for record in self._exception_history 
+                      if record.timestamp >= start_time]
+        
+        completed_count = initial_count - len(pending_final)
+        
+        result = TaskCompletionResult(
+            completed=completed_ok and len(pending_final) == 0,
+            total_tasks=initial_count,
+            completed_tasks=completed_count,
+            pending_tasks=pending_final,
+            timed_out_tasks=timed_out_tasks,
+            cancelled_tasks=cancelled,
+            error_tasks=error_tasks,
+            elapsed_time=elapsed
+        )
+        
+        if result.completed:
+            logger.info(f"✅ All {initial_count} tasks completed in {elapsed:.2f}s")
+        else:
+            logger.warning(
+                f"⚠️ Partial completion: {completed_count}/{initial_count} tasks completed in {elapsed:.2f}s. "
+                f"Pending: {len(pending_final)}, Errors: {len(error_tasks)}"
+            )
+        
+        return result
     
     def get_pending_task_count(self) -> int:
         """Get the number of pending tasks."""
@@ -239,23 +452,226 @@ class PositionTracker:
         """Get names of all pending tasks."""
         return [t.get_name() for t in self._pending_tasks]
     
-    async def _cancel_pending_tasks(self, timeout: float = TASK_CLEANUP_TIMEOUT):
-        """Cancel all pending tasks with proper cleanup.
+    def get_task_ages(self) -> Dict[str, float]:
+        """Get age in seconds for each running task"""
+        now = datetime.now(pytz.UTC)
+        ages = {}
+        for task_name, start_time in self._task_start_times.items():
+            ages[task_name] = (now - start_time).total_seconds()
+        return ages
+    
+    async def _monitor_task_timeouts(self) -> None:
+        """Background task to monitor for long-running and stuck tasks.
+        
+        - Logs warnings for tasks exceeding long_running_threshold
+        - Auto-cancels tasks exceeding auto_cancel_threshold
+        - Sends alerts for recurring slow tasks
+        """
+        logger.info(f"⏱️ Task timeout monitor started (warning: {self.long_running_threshold}s, auto-cancel: {self.auto_cancel_threshold}s)")
+        
+        try:
+            while not self._shutdown_event.is_set():
+                try:
+                    await asyncio.wait_for(
+                        self._shutdown_event.wait(),
+                        timeout=TASK_MONITOR_INTERVAL
+                    )
+                    break
+                except asyncio.TimeoutError:
+                    pass
+                
+                if not self._pending_tasks:
+                    continue
+                
+                now = datetime.now(pytz.UTC)
+                tasks_to_cancel = []
+                
+                for task in list(self._pending_tasks):
+                    if task.done():
+                        continue
+                    
+                    task_name = task.get_name()
+                    start_time = self._task_start_times.get(task_name)
+                    
+                    if not start_time:
+                        continue
+                    
+                    age = (now - start_time).total_seconds()
+                    
+                    if age >= self.auto_cancel_threshold:
+                        logger.warning(
+                            f"🚨 Task {task_name} exceeded auto-cancel threshold "
+                            f"({age:.1f}s > {self.auto_cancel_threshold}s) - scheduling cancellation"
+                        )
+                        tasks_to_cancel.append((task, task_name, age))
+                        
+                    elif age >= self.long_running_threshold:
+                        slow_count = self._slow_task_counts.get(task_name, 0)
+                        
+                        if slow_count == 0:
+                            logger.warning(
+                                f"⏱️ Task {task_name} is running long ({age:.1f}s > {self.long_running_threshold}s)"
+                            )
+                        
+                        if slow_count >= self.slow_task_alert_count:
+                            if slow_count == self.slow_task_alert_count:
+                                logger.error(
+                                    f"🔥 Recurring slow task detected: {task_name} "
+                                    f"(slow {slow_count} times)"
+                                )
+                                if self.alert_system:
+                                    try:
+                                        asyncio.create_task(
+                                            self.alert_system.send_system_error(
+                                                f"🔥 Recurring Slow Task Alert\n\n"
+                                                f"Task: {task_name}\n"
+                                                f"Slow count: {slow_count} times\n"
+                                                f"Current age: {age:.1f}s\n"
+                                                f"Threshold: {self.long_running_threshold}s\n\n"
+                                                f"Consider investigating this task for performance issues"
+                                            )
+                                        )
+                                    except Exception as e:
+                                        logger.error(f"Failed to send slow task alert: {e}")
+                
+                for task, task_name, age in tasks_to_cancel:
+                    try:
+                        logger.warning(f"🛑 Auto-cancelling stuck task: {task_name} (age: {age:.1f}s)")
+                        task.cancel()
+                        
+                        try:
+                            await asyncio.wait_for(asyncio.shield(task), timeout=2.0)
+                        except asyncio.TimeoutError:
+                            logger.error(f"❌ Task {task_name} did not respond to auto-cancel")
+                        except asyncio.CancelledError:
+                            logger.info(f"✓ Task {task_name} auto-cancelled successfully")
+                            
+                    except Exception as e:
+                        logger.error(f"Error auto-cancelling task {task_name}: {e}")
+                        
+        except asyncio.CancelledError:
+            logger.info("Task timeout monitor cancelled")
+        except Exception as e:
+            logger.error(f"Error in task timeout monitor: {e}")
+        finally:
+            logger.info("Task timeout monitor stopped")
+    
+    def start_task_monitor(self) -> asyncio.Task:
+        """Start the background task timeout monitor.
+        
+        Returns:
+            asyncio.Task: The monitor task
+        """
+        if self._task_monitor_task and not self._task_monitor_task.done():
+            logger.warning("Task monitor already running")
+            return self._task_monitor_task
+        
+        self._task_monitor_task = asyncio.create_task(
+            self._monitor_task_timeouts(),
+            name="task_timeout_monitor"
+        )
+        return self._task_monitor_task
+    
+    async def stop_task_monitor(self) -> None:
+        """Stop the task timeout monitor"""
+        if self._task_monitor_task and not self._task_monitor_task.done():
+            self._task_monitor_task.cancel()
+            try:
+                await self._task_monitor_task
+            except asyncio.CancelledError:
+                pass
+            self._task_monitor_task = None
+            logger.info("Task timeout monitor stopped")
+    
+    def configure_timeouts(self, long_running_threshold: float = None,
+                           auto_cancel_threshold: float = None,
+                           slow_task_alert_count: int = None) -> None:
+        """Configure task timeout thresholds.
         
         Args:
-            timeout: Maximum time to wait for task cancellation
+            long_running_threshold: Seconds before logging warning for slow tasks
+            auto_cancel_threshold: Seconds before auto-cancelling stuck tasks
+            slow_task_alert_count: Number of slow occurrences before alerting
         """
+        if long_running_threshold is not None:
+            self.long_running_threshold = long_running_threshold
+            logger.info(f"Long running threshold set to {long_running_threshold}s")
+        
+        if auto_cancel_threshold is not None:
+            self.auto_cancel_threshold = auto_cancel_threshold
+            logger.info(f"Auto-cancel threshold set to {auto_cancel_threshold}s")
+        
+        if slow_task_alert_count is not None:
+            self.slow_task_alert_count = slow_task_alert_count
+            logger.info(f"Slow task alert count set to {slow_task_alert_count}")
+    
+    def get_task_monitoring_stats(self) -> Dict[str, Any]:
+        """Get current task monitoring statistics.
+        
+        Returns:
+            Dict with current monitoring statistics
+        """
+        ages = self.get_task_ages()
+        
+        return {
+            "pending_count": len(self._pending_tasks),
+            "pending_tasks": self.get_pending_task_names(),
+            "task_ages": ages,
+            "slow_task_counts": dict(self._slow_task_counts),
+            "exception_count": len(self._exception_history),
+            "recent_exceptions": [
+                {"task": r.task_name, "type": r.exception_type, "time": r.timestamp.isoformat()}
+                for r in self._exception_history[-5:]
+            ],
+            "cancelled_tasks": list(self._cancelled_task_names),
+            "thresholds": {
+                "long_running": self.long_running_threshold,
+                "auto_cancel": self.auto_cancel_threshold,
+                "slow_alert_count": self.slow_task_alert_count
+            },
+            "monitor_running": self._task_monitor_task is not None and not self._task_monitor_task.done()
+        }
+    
+    async def _cancel_pending_tasks(self, timeout: float = TASK_CLEANUP_TIMEOUT,
+                                     per_task_timeout: float = 2.0,
+                                     force_cancel_on_timeout: bool = True) -> Dict[str, str]:
+        """Cancel all pending tasks with proper cleanup and detailed logging.
+        
+        Args:
+            timeout: Maximum total time to wait for all task cancellations
+            per_task_timeout: Timeout for individual task cancellation attempts
+            force_cancel_on_timeout: Whether to force cancel tasks that don't respond
+            
+        Returns:
+            Dict mapping task names to their final status (cancelled, timeout, error, etc.)
+        """
+        cancellation_results: Dict[str, str] = {}
+        
         if not self._pending_tasks:
             logger.info("No pending tasks to cancel")
-            return
+            return cancellation_results
         
         task_count = len(self._pending_tasks)
-        logger.info(f"Cancelling {task_count} pending tasks...")
+        logger.info(f"🛑 Initiating cancellation of {task_count} pending tasks (timeout: {timeout}s)...")
         
         tasks_to_cancel = list(self._pending_tasks)
+        task_names = {task: task.get_name() for task in tasks_to_cancel}
+        
+        uncancellable_tasks: List[str] = []
+        
         for task in tasks_to_cancel:
+            task_name = task_names[task]
             if not task.done():
-                task.cancel()
+                try:
+                    task.cancel()
+                    logger.debug(f"  Cancellation requested for: {task_name}")
+                except Exception as e:
+                    logger.warning(f"  ⚠️ Failed to request cancellation for {task_name}: {e}")
+                    uncancellable_tasks.append(task_name)
+                    cancellation_results[task_name] = f"cancel_request_failed: {e}"
+        
+        if uncancellable_tasks:
+            logger.warning(f"⚠️ {len(uncancellable_tasks)} tasks could not be cancelled: {uncancellable_tasks}")
         
         if tasks_to_cancel:
             try:
@@ -265,36 +681,80 @@ class PositionTracker:
                     return_when=asyncio.ALL_COMPLETED
                 )
                 
-                completed = len(done)
-                still_pending = len(pending)
-                
                 for task in done:
+                    task_name = task_names[task]
                     try:
                         if task.cancelled():
-                            logger.debug(f"Task {task.get_name()} cancelled successfully")
-                        elif task.exception():
-                            logger.warning(f"Task {task.get_name()} raised exception during cancel: {task.exception()}")
-                    except asyncio.CancelledError:
-                        pass
-                    except asyncio.InvalidStateError:
-                        pass
+                            cancellation_results[task_name] = "cancelled"
+                            logger.debug(f"  ✓ {task_name}: cancelled successfully")
+                        else:
+                            try:
+                                exc = task.exception()
+                                if exc:
+                                    cancellation_results[task_name] = f"error: {type(exc).__name__}"
+                                    logger.warning(f"  ⚠️ {task_name}: raised {type(exc).__name__} during cancel")
+                                else:
+                                    cancellation_results[task_name] = "completed"
+                                    logger.debug(f"  ✓ {task_name}: completed normally")
+                            except asyncio.CancelledError:
+                                cancellation_results[task_name] = "cancelled"
+                            except asyncio.InvalidStateError:
+                                cancellation_results[task_name] = "invalid_state"
+                                logger.debug(f"  ? {task_name}: invalid state")
+                    except Exception as e:
+                        cancellation_results[task_name] = f"check_failed: {e}"
+                        logger.error(f"  ❌ Error checking {task_name} status: {e}")
                 
-                if still_pending > 0:
-                    logger.warning(f"{still_pending} tasks did not complete within {timeout}s timeout")
+                if pending:
+                    logger.warning(f"⏰ {len(pending)} tasks did not complete within {timeout}s timeout")
+                    
                     for task in pending:
-                        if not task.done():
+                        task_name = task_names[task]
+                        cancellation_results[task_name] = "timeout"
+                        
+                        age = "unknown"
+                        if task_name in self._task_start_times:
+                            age_seconds = (datetime.now(pytz.UTC) - self._task_start_times[task_name]).total_seconds()
+                            age = f"{age_seconds:.1f}s"
+                        
+                        logger.warning(f"  ⏰ {task_name}: did not respond to cancel (age: {age})")
+                        
+                        if force_cancel_on_timeout and not task.done():
+                            logger.info(f"  🔨 Force cancelling {task_name}...")
                             task.cancel()
+                            try:
+                                await asyncio.wait_for(asyncio.shield(task), timeout=per_task_timeout)
+                            except asyncio.TimeoutError:
+                                cancellation_results[task_name] = "force_timeout"
+                                logger.error(f"  ❌ {task_name}: STUCK - did not respond to force cancel")
+                            except asyncio.CancelledError:
+                                cancellation_results[task_name] = "force_cancelled"
+                                logger.info(f"  ✓ {task_name}: force cancelled")
+                            except Exception as e:
+                                cancellation_results[task_name] = f"force_error: {e}"
+                                logger.error(f"  ❌ {task_name}: error during force cancel: {e}")
                 else:
-                    logger.info(f"All {completed} tasks completed cancellation")
+                    logger.info(f"✅ All {len(done)} tasks completed cancellation gracefully")
                     
             except Exception as e:
-                logger.error(f"Error during task cancellation: {e}")
+                logger.error(f"❌ Error during task cancellation phase: {e}")
         
         self._pending_tasks.clear()
         self._task_callbacks.clear()
         self._task_results.clear()
+        self._task_start_times.clear()
         self._completion_event.set()
-        logger.info("All pending tasks cancelled and cleaned up")
+        
+        cancelled_count = sum(1 for s in cancellation_results.values() if 'cancelled' in s)
+        timeout_count = sum(1 for s in cancellation_results.values() if 'timeout' in s)
+        error_count = sum(1 for s in cancellation_results.values() if 'error' in s)
+        
+        logger.info(
+            f"🧹 Task cleanup complete: {cancelled_count} cancelled, "
+            f"{timeout_count} timed out, {error_count} errors"
+        )
+        
+        return cancellation_results
     
     def set_signal_session_manager(self, signal_session_manager: SignalSessionManager):
         """Set signal session manager for dependency injection"""
@@ -1098,7 +1558,7 @@ class PositionTracker:
     async def shutdown(self, timeout: float = TASK_CLEANUP_TIMEOUT):
         """Graceful shutdown with proper resource cleanup
         
-        Cancels all pending tasks and stops monitoring loop.
+        Cancels all pending tasks, stops monitoring loop and task monitor.
         
         Args:
             timeout: Maximum time to wait for task cleanup
@@ -1108,6 +1568,8 @@ class PositionTracker:
         self.monitoring = False
         self._shutdown_event.set()
         
+        await self.stop_task_monitor()
+        
         if self._monitoring_task and not self._monitoring_task.done():
             logger.info("Cancelling monitoring task...")
             self._monitoring_task.cancel()
@@ -1116,7 +1578,15 @@ class PositionTracker:
             except (asyncio.CancelledError, asyncio.TimeoutError):
                 pass
         
-        await self._cancel_pending_tasks(timeout=timeout)
+        cancellation_results = await self._cancel_pending_tasks(timeout=timeout)
+        
+        if cancellation_results:
+            timeout_count = sum(1 for s in cancellation_results.values() if 'timeout' in s)
+            if timeout_count > 0:
+                logger.warning(f"Shutdown completed with {timeout_count} tasks that did not cancel cleanly")
+        
+        self._slow_task_counts.clear()
+        self._cancelled_task_names.clear()
         
         async with self._position_lock:
             active_count = sum(len(positions) for positions in self.active_positions.values())

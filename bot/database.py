@@ -1,7 +1,7 @@
 from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Boolean, Text, text, BigInteger, event
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, scoped_session
-from sqlalchemy.exc import SQLAlchemyError, OperationalError, IntegrityError
+from sqlalchemy.exc import SQLAlchemyError, OperationalError, IntegrityError, TimeoutError as SATimeoutError
 from sqlalchemy.exc import DatabaseError as SQLAlchemyDatabaseError
 from sqlalchemy.pool import QueuePool
 from contextlib import contextmanager
@@ -9,7 +9,7 @@ from datetime import datetime
 import os
 import time
 import threading
-from typing import Callable, Any, Optional, Generator, Dict
+from typing import Callable, Any, Optional, Generator, Dict, List
 from functools import wraps
 import logging
 
@@ -24,6 +24,9 @@ MAX_OVERFLOW = 10
 POOL_TIMEOUT = 30
 POOL_RECYCLE = 3600
 POOL_PRE_PING = True
+POOL_EXHAUSTED_MAX_RETRIES = 3
+POOL_EXHAUSTED_INITIAL_DELAY = 0.5
+POOL_HIGH_UTILIZATION_THRESHOLD = 80
 
 class DatabaseError(Exception):
     """Base exception for database errors"""
@@ -34,11 +37,22 @@ class RetryableError(DatabaseError):
     pass
 
 class ConnectionPoolExhausted(DatabaseError):
-    """Connection pool exhausted error"""
+    """Connection pool exhausted error after all retries failed"""
+    pass
+
+class PoolTimeoutError(DatabaseError):
+    """Pool timeout error - could not acquire connection in time"""
     pass
 
 def retry_on_db_error(max_retries: int = 3, initial_delay: float = 0.1):
-    """Decorator to retry database operations with exponential backoff"""
+    """Decorator to retry database operations with exponential backoff.
+    
+    Handles pool timeout errors and operational errors with retry logic.
+    
+    Args:
+        max_retries: Maximum number of retry attempts
+        initial_delay: Initial delay in seconds before first retry
+    """
     def decorator(func: Callable) -> Callable:
         @wraps(func)
         def wrapper(*args, **kwargs) -> Any:
@@ -48,6 +62,20 @@ def retry_on_db_error(max_retries: int = 3, initial_delay: float = 0.1):
             for attempt in range(max_retries):
                 try:
                     return func(*args, **kwargs)
+                except SATimeoutError as e:
+                    if attempt < max_retries - 1:
+                        logger.warning(
+                            f"Pool timeout in {func.__name__} (attempt {attempt + 1}/{max_retries}): {e}"
+                        )
+                        logger.info(f"Retrying in {delay:.2f}s...")
+                        time.sleep(delay)
+                        delay *= 2
+                        last_exception = e
+                    else:
+                        logger.error(f"Pool timeout - max retries reached for {func.__name__}: {e}")
+                        raise ConnectionPoolExhausted(
+                            f"Pool exhausted after {max_retries} retries in {func.__name__}"
+                        ) from e
                 except OperationalError as e:
                     if attempt < max_retries - 1:
                         logger.warning(f"Database operational error in {func.__name__} (attempt {attempt + 1}/{max_retries}): {e}")
@@ -186,9 +214,15 @@ class DatabaseManager:
             'checkins': 0,
             'connects': 0,
             'disconnects': 0,
-            'overflow_connections': 0
+            'overflow_connections': 0,
+            'timeout_errors': 0,
+            'high_utilization_warnings': 0,
+            'total_wait_time_ms': 0.0,
+            'max_wait_time_ms': 0.0,
+            'checkout_attempts': 0
         }
         self._pool_stats_lock = threading.Lock()
+        self._last_checkout_start = threading.local()
         
         try:
             if database_url and database_url.strip():
@@ -270,27 +304,59 @@ class DatabaseManager:
     
     def _setup_pool_event_listeners(self):
         """Setup event listeners for connection pool monitoring."""
+        db_manager = self
+        
         @event.listens_for(self.engine, 'checkout')
         def on_checkout(dbapi_conn, connection_record, connection_proxy):
-            with self._pool_stats_lock:
-                self._pool_stats['checkouts'] += 1
+            checkout_start = getattr(db_manager._last_checkout_start, 'start_time', None)
+            wait_time_ms = 0.0
+            if checkout_start is not None:
+                wait_time_ms = (time.time() - checkout_start) * 1000
+            
+            with db_manager._pool_stats_lock:
+                db_manager._pool_stats['checkouts'] += 1
+                if wait_time_ms > 0:
+                    db_manager._pool_stats['total_wait_time_ms'] += wait_time_ms
+                    if wait_time_ms > db_manager._pool_stats['max_wait_time_ms']:
+                        db_manager._pool_stats['max_wait_time_ms'] = wait_time_ms
+            
+            db_manager._check_and_warn_high_utilization()
         
         @event.listens_for(self.engine, 'checkin')
         def on_checkin(dbapi_conn, connection_record):
-            with self._pool_stats_lock:
-                self._pool_stats['checkins'] += 1
+            with db_manager._pool_stats_lock:
+                db_manager._pool_stats['checkins'] += 1
         
         @event.listens_for(self.engine, 'connect')
         def on_connect(dbapi_conn, connection_record):
-            with self._pool_stats_lock:
-                self._pool_stats['connects'] += 1
+            with db_manager._pool_stats_lock:
+                db_manager._pool_stats['connects'] += 1
         
         @event.listens_for(self.engine, 'close')
         def on_close(dbapi_conn, connection_record):
-            with self._pool_stats_lock:
-                self._pool_stats['disconnects'] += 1
+            with db_manager._pool_stats_lock:
+                db_manager._pool_stats['disconnects'] += 1
         
         logger.debug("Pool event listeners configured")
+    
+    def _check_and_warn_high_utilization(self):
+        """Check pool utilization and log warning if above threshold."""
+        try:
+            pool = self.engine.pool
+            if hasattr(pool, 'checkedout') and hasattr(pool, 'size'):
+                checked_out = pool.checkedout()
+                max_connections = pool.size() + MAX_OVERFLOW
+                if max_connections > 0:
+                    utilization = (checked_out / max_connections) * 100
+                    if utilization >= POOL_HIGH_UTILIZATION_THRESHOLD:
+                        with self._pool_stats_lock:
+                            self._pool_stats['high_utilization_warnings'] += 1
+                        logger.warning(
+                            f"⚠️ High pool utilization: {utilization:.1f}% "
+                            f"(checked_out={checked_out}, max={max_connections})"
+                        )
+        except Exception as e:
+            logger.debug(f"Error checking pool utilization: {e}")
     
     def get_pool_status(self) -> Dict:
         """Get current connection pool status.
@@ -314,7 +380,12 @@ class DatabaseManager:
             'total_checkins': stats['checkins'],
             'total_connects': stats['connects'],
             'total_disconnects': stats['disconnects'],
-            'is_postgres': self.is_postgres
+            'is_postgres': self.is_postgres,
+            'timeout_errors': stats['timeout_errors'],
+            'high_utilization_warnings': stats['high_utilization_warnings'],
+            'total_wait_time_ms': round(stats['total_wait_time_ms'], 2),
+            'max_wait_time_ms': round(stats['max_wait_time_ms'], 2),
+            'avg_wait_time_ms': round(stats['total_wait_time_ms'] / max(stats['checkout_attempts'], 1), 2)
         }
         
         active = stats['checkouts'] - stats['checkins']
@@ -326,15 +397,76 @@ class DatabaseManager:
         
         return status
     
-    def log_pool_status(self):
-        """Log current pool status for monitoring."""
+    def log_pool_status(self, level: str = 'info'):
+        """Log current pool status for monitoring.
+        
+        Args:
+            level: Log level - 'info', 'warning', or 'error'
+        """
         status = self.get_pool_status()
-        logger.info(
+        message = (
             f"Pool Status: checked_in={status['checked_in']}, "
             f"checked_out={status['checked_out']}, "
             f"overflow={status['overflow']}, "
-            f"utilization={status.get('pool_utilization_percent', 'N/A')}%"
+            f"utilization={status.get('pool_utilization_percent', 'N/A')}%, "
+            f"timeouts={status['timeout_errors']}, "
+            f"avg_wait={status['avg_wait_time_ms']}ms"
         )
+        
+        if level == 'warning':
+            logger.warning(message)
+        elif level == 'error':
+            logger.error(message)
+        else:
+            logger.info(message)
+    
+    def check_pool_health(self) -> Dict:
+        """Perform periodic pool health check.
+        
+        Returns:
+            Dict with health status and recommendations
+        """
+        status = self.get_pool_status()
+        health = {
+            'healthy': True,
+            'status': status,
+            'warnings': [],
+            'recommendations': []
+        }
+        
+        utilization = status.get('pool_utilization_percent', 0)
+        if utilization >= POOL_HIGH_UTILIZATION_THRESHOLD:
+            health['healthy'] = False
+            health['warnings'].append(f"High pool utilization: {utilization}%")
+            health['recommendations'].append("Consider increasing pool_size or max_overflow")
+        
+        if status['timeout_errors'] > 0:
+            health['warnings'].append(f"Pool timeout errors occurred: {status['timeout_errors']}")
+            if status['timeout_errors'] > 5:
+                health['healthy'] = False
+                health['recommendations'].append("Investigate connection leaks or increase pool timeout")
+        
+        avg_wait = status['avg_wait_time_ms']
+        if avg_wait > 1000:
+            health['warnings'].append(f"High average wait time: {avg_wait}ms")
+            health['recommendations'].append("Pool may be undersized for current load")
+        
+        max_wait = status['max_wait_time_ms']
+        if max_wait > 5000:
+            health['warnings'].append(f"Very high max wait time: {max_wait}ms")
+        
+        checked_out = status.get('checked_out', 0)
+        if isinstance(checked_out, int) and checked_out == status['pool_size'] + status['max_overflow']:
+            health['healthy'] = False
+            health['warnings'].append("Pool is at maximum capacity")
+            health['recommendations'].append("All connections in use, requests may timeout")
+        
+        if health['warnings']:
+            logger.warning(f"Pool health check warnings: {health['warnings']}")
+        else:
+            logger.debug("Pool health check: OK")
+        
+        return health
     
     def _configure_database(self):
         """Configure database with proper settings (SQLite only)"""
@@ -553,79 +685,192 @@ class DatabaseManager:
             logger.error(f"Error migrating positions table: {e}")
             raise
     
-    @retry_on_db_error(max_retries=2, initial_delay=0.05)
+    def _get_session_with_pool_retry(
+        self, 
+        max_retries: int = POOL_EXHAUSTED_MAX_RETRIES,
+        initial_delay: float = POOL_EXHAUSTED_INITIAL_DELAY
+    ):
+        """Get session with retry logic for pool exhaustion.
+        
+        Implements exponential backoff when pool is exhausted.
+        
+        Args:
+            max_retries: Maximum number of retry attempts
+            initial_delay: Initial delay in seconds before first retry
+            
+        Returns:
+            Session object for database operations
+            
+        Raises:
+            ConnectionPoolExhausted: If pool is exhausted after all retries
+            PoolTimeoutError: If timeout occurs and retries are exhausted
+            DatabaseError: For other session creation failures
+        """
+        delay = initial_delay
+        last_exception = None
+        
+        for attempt in range(max_retries + 1):
+            try:
+                with self._pool_stats_lock:
+                    self._pool_stats['checkout_attempts'] += 1
+                
+                self._last_checkout_start.start_time = time.time()
+                session = self.Session()
+                return session
+                
+            except SATimeoutError as e:
+                last_exception = e
+                with self._pool_stats_lock:
+                    self._pool_stats['timeout_errors'] += 1
+                
+                self.log_pool_status(level='warning')
+                
+                if attempt < max_retries:
+                    logger.warning(
+                        f"⚠️ Pool timeout on attempt {attempt + 1}/{max_retries + 1}: {e}. "
+                        f"Retrying in {delay:.2f}s..."
+                    )
+                    time.sleep(delay)
+                    delay *= 2
+                else:
+                    logger.error(
+                        f"❌ Pool exhausted after {max_retries + 1} attempts. "
+                        f"Last error: {e}"
+                    )
+                    self.log_pool_status(level='error')
+                    raise ConnectionPoolExhausted(
+                        f"Connection pool exhausted after {max_retries + 1} attempts. "
+                        f"Pool timeout: {POOL_TIMEOUT}s. Consider increasing pool_size or max_overflow."
+                    ) from e
+                    
+            except OperationalError as e:
+                last_exception = e
+                error_str = str(e).lower()
+                if 'timeout' in error_str or 'pool' in error_str:
+                    with self._pool_stats_lock:
+                        self._pool_stats['timeout_errors'] += 1
+                    
+                    if attempt < max_retries:
+                        logger.warning(
+                            f"⚠️ Pool operational error on attempt {attempt + 1}/{max_retries + 1}: {e}. "
+                            f"Retrying in {delay:.2f}s..."
+                        )
+                        self.log_pool_status(level='warning')
+                        time.sleep(delay)
+                        delay *= 2
+                    else:
+                        logger.error(f"❌ Pool exhausted (operational error) after {max_retries + 1} attempts: {e}")
+                        self.log_pool_status(level='error')
+                        raise ConnectionPoolExhausted(
+                            f"Connection pool exhausted (operational error) after {max_retries + 1} attempts"
+                        ) from e
+                else:
+                    logger.error(f"Operational error creating session: {e}")
+                    self.log_pool_status(level='error')
+                    raise
+                    
+            except Exception as e:
+                logger.error(f"Unexpected error creating database session: {type(e).__name__}: {e}")
+                self.log_pool_status(level='error')
+                raise DatabaseError(f"Failed to create session: {e}") from e
+        
+        if last_exception:
+            raise ConnectionPoolExhausted(
+                f"Connection pool exhausted after {max_retries + 1} attempts"
+            ) from last_exception
+    
     def get_session(self):
-        """Get database session with retry logic and pool monitoring.
+        """Get database session with pool timeout handling and retry logic.
         
         Returns:
             Session object for database operations
             
         Raises:
-            DatabaseError: If session creation fails after retries
+            ConnectionPoolExhausted: If pool is exhausted after all retries
+            DatabaseError: If session creation fails
         """
-        try:
-            session = self.Session()
-            return session
-        except Exception as e:
-            logger.error(f"Error creating database session: {e}")
-            self.log_pool_status()
-            raise DatabaseError(f"Failed to create session: {e}")
+        return self._get_session_with_pool_retry()
     
     @contextmanager
     def safe_session(self) -> Generator:
         """Context manager for safe session handling with guaranteed rollback and closure.
         
         Provides per-operation rollback guarantees via try/except and safe session
-        closure in finally blocks.
+        closure in finally blocks. Includes pool timeout handling with graceful degradation.
         
         Usage:
             with db.safe_session() as session:
                 # do database operations
                 session.add(...)
                 # auto-commit on success, auto-rollback on failure
+                
+        Raises:
+            ConnectionPoolExhausted: If pool is exhausted after all retries
+            DatabaseError: For other session creation failures
         """
-        session = self.get_session()
+        session = None
         try:
+            session = self.get_session()
             yield session
             session.commit()
+        except ConnectionPoolExhausted:
+            logger.error("Safe session failed: connection pool exhausted")
+            raise
+        except SATimeoutError as e:
+            if session:
+                try:
+                    session.rollback()
+                except Exception as rollback_error:
+                    logger.error(f"Error during rollback after pool timeout: {rollback_error}")
+            logger.error(f"Pool timeout in safe_session: {e}")
+            self.log_pool_status(level='error')
+            raise PoolTimeoutError(f"Pool timeout during session operation: {e}") from e
         except IntegrityError as e:
-            try:
-                session.rollback()
-            except Exception as rollback_error:
-                logger.error(f"Error during rollback after IntegrityError: {rollback_error}")
+            if session:
+                try:
+                    session.rollback()
+                except Exception as rollback_error:
+                    logger.error(f"Error during rollback after IntegrityError: {rollback_error}")
             logger.error(f"Integrity error in safe_session: {e}")
             raise
         except OperationalError as e:
-            try:
-                session.rollback()
-            except Exception as rollback_error:
-                logger.error(f"Error during rollback after OperationalError: {rollback_error}")
+            if session:
+                try:
+                    session.rollback()
+                except Exception as rollback_error:
+                    logger.error(f"Error during rollback after OperationalError: {rollback_error}")
             logger.error(f"Operational error in safe_session: {e}")
             raise
         except SQLAlchemyError as e:
-            try:
-                session.rollback()
-            except Exception as rollback_error:
-                logger.error(f"Error during rollback after SQLAlchemyError: {rollback_error}")
+            if session:
+                try:
+                    session.rollback()
+                except Exception as rollback_error:
+                    logger.error(f"Error during rollback after SQLAlchemyError: {rollback_error}")
             logger.error(f"SQLAlchemy error in safe_session: {e}")
             raise
         except Exception as e:
-            try:
-                session.rollback()
-            except Exception as rollback_error:
-                logger.error(f"Error during rollback: {rollback_error}")
+            if session:
+                try:
+                    session.rollback()
+                except Exception as rollback_error:
+                    logger.error(f"Error during rollback: {rollback_error}")
             logger.error(f"Unexpected error in safe_session: {type(e).__name__}: {e}")
             raise
         finally:
-            try:
-                session.close()
-            except Exception as close_error:
-                logger.error(f"Error closing session: {close_error}")
+            if session:
+                try:
+                    session.close()
+                except Exception as close_error:
+                    logger.error(f"Error closing session: {close_error}")
     
     @contextmanager
     def transaction_scope(self, isolation_level: Optional[str] = None) -> Generator:
         """
-        Provide a transactional scope with proper isolation.
+        Provide a transactional scope with proper isolation and pool timeout handling.
+        
+        Includes graceful degradation with retry logic for pool exhaustion scenarios.
+        Connection is always returned to pool in finally block.
         
         Args:
             isolation_level: Optional isolation level ('SERIALIZABLE', 'REPEATABLE READ', 'READ COMMITTED')
@@ -635,56 +880,81 @@ class DatabaseManager:
                 # do database operations
                 session.add(...)
                 # auto-commit on success, auto-rollback on failure
+                
+        Raises:
+            ConnectionPoolExhausted: If pool is exhausted after all retries
+            PoolTimeoutError: If timeout occurs during session operations
         """
-        session = self.Session()
+        session = None
         transaction_exception = None
         
         try:
+            session = self.get_session()
+            
             if isolation_level and self.is_postgres:
                 session.execute(text(f"SET TRANSACTION ISOLATION LEVEL {isolation_level}"))
             
             yield session
             session.commit()
             
+        except ConnectionPoolExhausted as e:
+            transaction_exception = e
+            logger.error(f"Transaction failed: connection pool exhausted")
+            raise
+        except SATimeoutError as e:
+            transaction_exception = e
+            if session:
+                try:
+                    session.rollback()
+                except Exception as rollback_error:
+                    logger.error(f"Error during rollback after pool timeout: {rollback_error}")
+            logger.error(f"Transaction rolled back due to pool timeout: {e}")
+            self.log_pool_status(level='error')
+            raise PoolTimeoutError(f"Pool timeout during transaction: {e}") from e
         except IntegrityError as e:
             transaction_exception = e
-            try:
-                session.rollback()
-            except Exception as rollback_error:
-                logger.error(f"Error during rollback after IntegrityError: {rollback_error}")
+            if session:
+                try:
+                    session.rollback()
+                except Exception as rollback_error:
+                    logger.error(f"Error during rollback after IntegrityError: {rollback_error}")
             logger.error(f"Transaction rolled back due to integrity error: {e}")
             raise
         except OperationalError as e:
             transaction_exception = e
-            try:
-                session.rollback()
-            except Exception as rollback_error:
-                logger.error(f"Error during rollback after OperationalError: {rollback_error}")
+            if session:
+                try:
+                    session.rollback()
+                except Exception as rollback_error:
+                    logger.error(f"Error during rollback after OperationalError: {rollback_error}")
             logger.error(f"Transaction rolled back due to operational error: {e}")
             raise
         except SQLAlchemyError as e:
             transaction_exception = e
-            try:
-                session.rollback()
-            except Exception as rollback_error:
-                logger.error(f"Error during rollback after SQLAlchemyError: {rollback_error}")
+            if session:
+                try:
+                    session.rollback()
+                except Exception as rollback_error:
+                    logger.error(f"Error during rollback after SQLAlchemyError: {rollback_error}")
             logger.error(f"Transaction rolled back due to SQLAlchemy error: {e}")
             raise
         except Exception as e:
             transaction_exception = e
-            try:
-                session.rollback()
-            except Exception as rollback_error:
-                logger.error(f"Error during rollback: {rollback_error}")
+            if session:
+                try:
+                    session.rollback()
+                except Exception as rollback_error:
+                    logger.error(f"Error during rollback: {rollback_error}")
             logger.error(f"Transaction rolled back: {type(e).__name__}: {e}")
             raise
         finally:
-            try:
-                session.close()
-            except Exception as close_error:
-                logger.error(f"Error closing session: {close_error}")
-                if transaction_exception is None:
-                    raise
+            if session:
+                try:
+                    session.close()
+                except Exception as close_error:
+                    logger.error(f"Error closing session: {close_error}")
+                    if transaction_exception is None:
+                        raise
     
     @contextmanager
     def serializable_transaction(self) -> Generator:

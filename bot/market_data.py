@@ -294,6 +294,74 @@ class OHLCBuilder:
         }
 
 
+class SubscriberHealthMetrics:
+    """Track individual subscriber health metrics for monitoring and eviction decisions"""
+    
+    def __init__(self, name: str):
+        self.name = name
+        self.created_at: float = time.time()
+        self.last_success_time: float = time.time()
+        self.last_activity_time: float = time.time()
+        self.total_messages_sent: int = 0
+        self.total_messages_dropped: int = 0
+        self.consecutive_failures: int = 0
+        self.last_failure_time: Optional[float] = None
+        self.drop_rate_window: deque = deque(maxlen=100)
+    
+    def record_success(self):
+        """Record a successful message delivery"""
+        current_time = time.time()
+        self.last_success_time = current_time
+        self.last_activity_time = current_time
+        self.total_messages_sent += 1
+        self.consecutive_failures = 0
+        self.drop_rate_window.append(True)
+    
+    def record_drop(self):
+        """Record a dropped message"""
+        current_time = time.time()
+        self.last_activity_time = current_time
+        self.last_failure_time = current_time
+        self.total_messages_dropped += 1
+        self.consecutive_failures += 1
+        self.drop_rate_window.append(False)
+    
+    def get_drop_rate(self) -> float:
+        """Calculate drop rate from recent window (0.0 to 1.0)"""
+        if not self.drop_rate_window:
+            return 0.0
+        drops = sum(1 for success in self.drop_rate_window if not success)
+        return drops / len(self.drop_rate_window)
+    
+    def get_inactive_seconds(self) -> float:
+        """Get seconds since last successful delivery"""
+        return time.time() - self.last_success_time
+    
+    def get_zombie_seconds(self) -> float:
+        """Get seconds since last activity (success or failure)"""
+        return time.time() - self.last_activity_time
+    
+    def is_high_drop_rate(self, threshold: float = 0.3) -> bool:
+        """Check if drop rate exceeds threshold"""
+        if len(self.drop_rate_window) < 10:
+            return False
+        return self.get_drop_rate() > threshold
+    
+    def get_stats(self) -> Dict:
+        """Get subscriber statistics"""
+        return {
+            'name': self.name,
+            'uptime_seconds': round(time.time() - self.created_at, 1),
+            'messages_sent': self.total_messages_sent,
+            'messages_dropped': self.total_messages_dropped,
+            'drop_rate': round(self.get_drop_rate() * 100, 2),
+            'consecutive_failures': self.consecutive_failures,
+            'inactive_seconds': round(self.get_inactive_seconds(), 1),
+            'zombie_seconds': round(self.get_zombie_seconds(), 1),
+            'is_high_drop_rate': self.is_high_drop_rate()
+        }
+
+
 class ConnectionMetrics:
     """Track WebSocket connection metrics for monitoring"""
     
@@ -394,12 +462,22 @@ class MarketDataClient:
         self.price_volatility = 2.0
         
         self.subscribers = {}
-        self.subscriber_failures = {}
-        self.subscriber_last_success = {}
+        self.subscriber_health: Dict[str, SubscriberHealthMetrics] = {}
         self.subscriber_lock = asyncio.Lock()
         self.max_consecutive_failures = 5
         self.subscriber_stale_timeout = 300
+        self.subscriber_zombie_timeout = 120
+        self.subscriber_cleanup_interval = 60
+        self.high_drop_rate_threshold = 0.3
+        self.high_drop_rate_warning_interval = 30
+        self.last_drop_rate_warning: Dict[str, float] = {}
         self.tick_log_counter = 0
+        
+        self.simulator_price_min = 1800.0
+        self.simulator_price_max = 3500.0
+        self.simulator_spread_min = 0.20
+        self.simulator_spread_max = 0.80
+        self.simulator_last_timestamp: Optional[datetime] = None
         
         self.ws_timeout = 30
         self.fetch_timeout = 10
@@ -450,21 +528,29 @@ class MarketDataClient:
                 logger.debug(f"💰 Tick: Bid={bid:.2f}, Ask={ask:.2f}, Quote={quote:.2f}")
     
     async def subscribe_ticks(self, name: str) -> asyncio.Queue:
-        """Subscribe to tick feed with proper lifecycle tracking"""
+        """Subscribe to tick feed with proper lifecycle tracking and health metrics"""
         async with self.subscriber_lock:
             if self._shutdown_in_progress:
                 raise RuntimeError("Cannot subscribe during shutdown")
             
             queue = asyncio.Queue(maxsize=500)
             self.subscribers[name] = queue
-            self.subscriber_failures[name] = 0
-            self.subscriber_last_success[name] = time.time()
-            logger.debug(f"Subscriber '{name}' registered untuk tick feed")
+            self.subscriber_health[name] = SubscriberHealthMetrics(name)
+            logger.info(f"✅ Subscriber '{name}' registered with health metrics tracking")
             return queue
     
     async def unsubscribe_ticks(self, name: str):
-        """Unsubscribe from tick feed with proper cleanup"""
+        """Unsubscribe from tick feed with proper cleanup and metrics logging"""
         async with self.subscriber_lock:
+            health = self.subscriber_health.get(name)
+            if health:
+                stats = health.get_stats()
+                logger.info(
+                    f"📊 Subscriber '{name}' final stats: "
+                    f"sent={stats['messages_sent']}, dropped={stats['messages_dropped']}, "
+                    f"drop_rate={stats['drop_rate']}%, uptime={stats['uptime_seconds']}s"
+                )
+            
             if name in self.subscribers:
                 try:
                     queue = self.subscribers[name]
@@ -477,77 +563,181 @@ class MarketDataClient:
                     logger.debug(f"Error draining queue for '{name}': {e}")
                 
                 del self.subscribers[name]
-                
-            if name in self.subscriber_failures:
-                del self.subscriber_failures[name]
-            if name in self.subscriber_last_success:
-                del self.subscriber_last_success[name]
+            
+            if name in self.subscriber_health:
+                del self.subscriber_health[name]
+            if name in self.last_drop_rate_warning:
+                del self.last_drop_rate_warning[name]
             
             logger.debug(f"Subscriber '{name}' unregistered dari tick feed")
     
     async def cleanup_stale_subscribers(self) -> List[str]:
-        """Clean up stale subscribers that haven't been active
+        """Clean up stale and zombie subscribers with detailed metrics
+        
+        Eviction criteria:
+        1. Stale: No successful delivery for subscriber_stale_timeout seconds
+        2. Zombie: No activity (success or failure) for subscriber_zombie_timeout seconds
+        3. High failures: max_consecutive_failures reached
+        4. High drop rate: Sustained high drop rate (logged as warning, evicted if combined with other issues)
         
         Returns:
-            List of removed subscriber names
+            List of removed subscriber names with eviction reasons
         """
         removed = []
+        eviction_reasons = {}
         current_time = time.time()
         
         async with self.subscriber_lock:
             stale_names = []
             
             for name in list(self.subscribers.keys()):
-                last_success = self.subscriber_last_success.get(name, 0)
-                failures = self.subscriber_failures.get(name, 0)
+                health = self.subscriber_health.get(name)
+                if not health:
+                    stale_names.append(name)
+                    eviction_reasons[name] = "missing health metrics"
+                    logger.warning(f"⚠️ Subscriber '{name}' has no health metrics - marking for eviction")
+                    continue
+                
+                inactive_time = health.get_inactive_seconds()
+                zombie_time = health.get_zombie_seconds()
+                failures = health.consecutive_failures
+                drop_rate = health.get_drop_rate()
+                is_high_drop = health.is_high_drop_rate(self.high_drop_rate_threshold)
                 
                 is_stale = False
-                reason = ""
+                reasons = []
                 
-                if current_time - last_success > self.subscriber_stale_timeout:
+                if zombie_time > self.subscriber_zombie_timeout:
                     is_stale = True
-                    reason = f"inactive for {current_time - last_success:.0f}s"
-                elif failures >= self.max_consecutive_failures:
+                    reasons.append(f"zombie for {zombie_time:.0f}s (no activity)")
+                    logger.warning(
+                        f"🧟 ZOMBIE subscriber '{name}': no activity for {zombie_time:.0f}s "
+                        f"(threshold: {self.subscriber_zombie_timeout}s)"
+                    )
+                
+                if inactive_time > self.subscriber_stale_timeout:
                     is_stale = True
-                    reason = f"{failures} consecutive failures"
+                    reasons.append(f"stale for {inactive_time:.0f}s (no success)")
+                
+                if failures >= self.max_consecutive_failures:
+                    is_stale = True
+                    reasons.append(f"{failures} consecutive failures")
+                
+                if is_high_drop and (inactive_time > 60 or failures >= 3):
+                    is_stale = True
+                    reasons.append(f"high drop rate {drop_rate*100:.1f}% with issues")
+                
+                if is_high_drop and not is_stale:
+                    last_warning = self.last_drop_rate_warning.get(name, 0)
+                    if current_time - last_warning > self.high_drop_rate_warning_interval:
+                        logger.warning(
+                            f"⚠️ HIGH DROP RATE for '{name}': {drop_rate*100:.1f}% "
+                            f"(dropped {health.total_messages_dropped}/{health.total_messages_sent + health.total_messages_dropped} messages)"
+                        )
+                        self.last_drop_rate_warning[name] = current_time
                 
                 if is_stale:
                     stale_names.append(name)
-                    logger.warning(f"Subscriber '{name}' marked stale: {reason}")
+                    eviction_reasons[name] = "; ".join(reasons)
             
             for name in stale_names:
+                health = self.subscriber_health.get(name)
+                reason = eviction_reasons.get(name, "unknown")
+                
+                if health:
+                    stats = health.get_stats()
+                    logger.warning(
+                        f"🚫 EVICTING subscriber '{name}': {reason} | "
+                        f"Stats: sent={stats['messages_sent']}, dropped={stats['messages_dropped']}, "
+                        f"drop_rate={stats['drop_rate']}%, failures={stats['consecutive_failures']}"
+                    )
+                else:
+                    logger.warning(f"🚫 EVICTING subscriber '{name}': {reason}")
+                
                 try:
                     queue = self.subscribers.get(name)
                     if queue:
+                        drained = 0
                         while not queue.empty():
                             try:
                                 queue.get_nowait()
+                                drained += 1
                             except asyncio.QueueEmpty:
                                 break
+                        if drained > 0:
+                            logger.debug(f"Drained {drained} pending messages from '{name}' queue")
                 except Exception as e:
                     logger.debug(f"Error draining stale queue '{name}': {e}")
                 
                 if name in self.subscribers:
                     del self.subscribers[name]
-                if name in self.subscriber_failures:
-                    del self.subscriber_failures[name]
-                if name in self.subscriber_last_success:
-                    del self.subscriber_last_success[name]
+                if name in self.subscriber_health:
+                    del self.subscriber_health[name]
+                if name in self.last_drop_rate_warning:
+                    del self.last_drop_rate_warning[name]
                 
                 removed.append(name)
-                logger.info(f"Removed stale subscriber '{name}'")
         
         if removed:
-            logger.info(f"Cleaned up {len(removed)} stale subscribers: {removed}")
+            logger.info(f"✅ Cleanup completed: evicted {len(removed)} subscribers")
+            for name in removed:
+                logger.info(f"   - {name}: {eviction_reasons.get(name, 'unknown')}")
         
         return removed
     
+    async def get_subscriber_health_report(self) -> Dict:
+        """Get health report for all subscribers
+        
+        Returns:
+            Dictionary with subscriber health statistics
+        """
+        async with self.subscriber_lock:
+            report = {
+                'total_subscribers': len(self.subscribers),
+                'healthy': 0,
+                'warning': 0,
+                'critical': 0,
+                'subscribers': {}
+            }
+            
+            for name, health in self.subscriber_health.items():
+                stats = health.get_stats()
+                
+                status = 'healthy'
+                if health.consecutive_failures >= self.max_consecutive_failures:
+                    status = 'critical'
+                elif health.is_high_drop_rate(self.high_drop_rate_threshold):
+                    status = 'warning'
+                elif health.get_inactive_seconds() > 60:
+                    status = 'warning'
+                
+                stats['status'] = status
+                report['subscribers'][name] = stats
+                
+                if status == 'healthy':
+                    report['healthy'] += 1
+                elif status == 'warning':
+                    report['warning'] += 1
+                else:
+                    report['critical'] += 1
+            
+            return report
+    
     async def _unsubscribe_all(self):
-        """Unsubscribe all subscribers during shutdown"""
+        """Unsubscribe all subscribers during shutdown with final stats"""
         async with self.subscriber_lock:
             subscriber_names = list(self.subscribers.keys())
             
             for name in subscriber_names:
+                health = self.subscriber_health.get(name)
+                if health:
+                    stats = health.get_stats()
+                    logger.info(
+                        f"📊 Shutdown stats for '{name}': "
+                        f"sent={stats['messages_sent']}, dropped={stats['messages_dropped']}, "
+                        f"drop_rate={stats['drop_rate']}%"
+                    )
+                
                 try:
                     queue = self.subscribers.get(name)
                     if queue:
@@ -560,14 +750,14 @@ class MarketDataClient:
                     logger.debug(f"Error draining queue '{name}' during shutdown: {e}")
             
             self.subscribers.clear()
-            self.subscriber_failures.clear()
-            self.subscriber_last_success.clear()
+            self.subscriber_health.clear()
+            self.last_drop_rate_warning.clear()
             
             if subscriber_names:
                 logger.info(f"Unsubscribed all {len(subscriber_names)} subscribers during shutdown")
     
     async def _broadcast_tick(self, tick_data: Dict):
-        """Broadcast tick to subscribers with NaN validation at boundary"""
+        """Broadcast tick to subscribers with NaN validation and health metrics tracking"""
         if not self.subscribers:
             return
         
@@ -577,10 +767,10 @@ class MarketDataClient:
             return
         
         stale_subscribers = []
-        current_time = time.time()
         
         async with self.subscriber_lock:
             for name, queue in list(self.subscribers.items()):
+                health = self.subscriber_health.get(name)
                 success = False
                 max_retries = 3
                 
@@ -588,8 +778,8 @@ class MarketDataClient:
                     try:
                         queue.put_nowait(sanitized_data)
                         success = True
-                        self.subscriber_failures[name] = 0
-                        self.subscriber_last_success[name] = current_time
+                        if health:
+                            health.record_success()
                         break
                         
                     except asyncio.QueueFull:
@@ -598,18 +788,22 @@ class MarketDataClient:
                             logger.debug(f"Queue full for '{name}', retry {attempt + 1}/{max_retries} after {backoff_time}s")
                             await asyncio.sleep(backoff_time)
                         else:
-                            logger.warning(f"Queue full for subscriber '{name}' after {max_retries} retries, skipping tick")
+                            logger.debug(f"Queue full for subscriber '{name}' after {max_retries} retries, message dropped")
                             
                     except Exception as e:
                         logger.error(f"Error broadcasting tick to '{name}': {e}")
                         break
                 
                 if not success:
-                    self.subscriber_failures[name] = self.subscriber_failures.get(name, 0) + 1
-                    
-                    if self.subscriber_failures[name] >= self.max_consecutive_failures:
-                        logger.warning(f"Subscriber '{name}' failed {self.subscriber_failures[name]} times consecutively, marking for removal")
-                        stale_subscribers.append(name)
+                    if health:
+                        health.record_drop()
+                        
+                        if health.consecutive_failures >= self.max_consecutive_failures:
+                            logger.warning(
+                                f"⚠️ Subscriber '{name}' exceeded failure threshold: "
+                                f"{health.consecutive_failures} consecutive failures, marking for removal"
+                            )
+                            stale_subscribers.append(name)
         
         for name in stale_subscribers:
             await self.unsubscribe_ticks(name)
@@ -857,15 +1051,37 @@ class MarketDataClient:
                 await self._handle_reconnect()
     
     async def _periodic_stale_cleanup(self):
-        """Periodically clean up stale subscribers"""
+        """Periodically clean up stale and zombie subscribers with configurable interval"""
+        cleanup_count = 0
         try:
+            logger.info(
+                f"🔄 Starting periodic subscriber cleanup (interval={self.subscriber_cleanup_interval}s, "
+                f"stale_timeout={self.subscriber_stale_timeout}s, zombie_timeout={self.subscriber_zombie_timeout}s)"
+            )
             while self.running and self.connected:
-                await asyncio.sleep(60)
-                await self.cleanup_stale_subscribers()
+                await asyncio.sleep(self.subscriber_cleanup_interval)
+                
+                try:
+                    removed = await self.cleanup_stale_subscribers()
+                    cleanup_count += 1
+                    
+                    if cleanup_count % 10 == 0:
+                        health_report = await self.get_subscriber_health_report()
+                        if health_report['total_subscribers'] > 0:
+                            logger.info(
+                                f"📊 Subscriber health report (cycle {cleanup_count}): "
+                                f"total={health_report['total_subscribers']}, "
+                                f"healthy={health_report['healthy']}, "
+                                f"warning={health_report['warning']}, "
+                                f"critical={health_report['critical']}"
+                            )
+                except Exception as cleanup_err:
+                    logger.error(f"Error during cleanup cycle {cleanup_count}: {cleanup_err}")
+                    
         except asyncio.CancelledError:
-            pass
+            logger.debug(f"Periodic cleanup task cancelled after {cleanup_count} cycles")
         except Exception as e:
-            logger.error(f"Error in periodic stale cleanup: {e}")
+            logger.error(f"Fatal error in periodic stale cleanup: {e}", exc_info=True)
     
     async def _send_heartbeat(self):
         while self.running and self.ws:
@@ -982,36 +1198,156 @@ class MarketDataClient:
                 logger.error(f"Failed to start simulator: {e}", exc_info=True)
     
     def _seed_initial_tick(self):
-        spread = 0.40
-        self.current_bid = self.base_price - (spread / 2)
-        self.current_ask = self.base_price + (spread / 2)
+        """Seed initial tick data with validated prices for simulator startup"""
+        spread = max(self.simulator_spread_min, min(0.40, self.simulator_spread_max))
+        
+        mid_price = max(
+            self.simulator_price_min + spread,
+            min(self.base_price, self.simulator_price_max - spread)
+        )
+        
+        self.current_bid = mid_price - (spread / 2)
+        self.current_ask = mid_price + (spread / 2)
         self.current_timestamp = datetime.now(pytz.UTC)
+        self.current_quote = mid_price
+        self.simulator_last_timestamp = self.current_timestamp
+        
+        is_valid_bid, _ = self._validate_simulator_price(self.current_bid)
+        is_valid_ask, _ = self._validate_simulator_price(self.current_ask)
+        
+        if not (is_valid_bid and is_valid_ask):
+            logger.warning(
+                f"Initial tick prices out of range, using safe defaults: "
+                f"range=[${self.simulator_price_min:.2f}-${self.simulator_price_max:.2f}]"
+            )
+            safe_price = (self.simulator_price_min + self.simulator_price_max) / 2
+            self.current_bid = safe_price - (spread / 2)
+            self.current_ask = safe_price + (spread / 2)
+            self.base_price = safe_price
         
         self.m1_builder.add_tick(self.current_bid, self.current_ask, self.current_timestamp)
         self.m5_builder.add_tick(self.current_bid, self.current_ask, self.current_timestamp)
         
-        logger.info(f"Initial tick seeded: Bid=${self.current_bid:.2f}, Ask=${self.current_ask:.2f}")
+        logger.info(
+            f"Initial tick seeded: Bid=${self.current_bid:.2f}, Ask=${self.current_ask:.2f}, "
+            f"Spread=${spread:.2f}, Timestamp={self.current_timestamp.isoformat()}"
+        )
+    
+    def _validate_simulator_price(self, price: float) -> Tuple[bool, Optional[str]]:
+        """Validate simulator price is within realistic XAU/USD range
+        
+        Args:
+            price: Price to validate
+            
+        Returns:
+            Tuple of (is_valid, error_message)
+        """
+        if not is_valid_price(price):
+            return False, f"Invalid price value: {price}"
+        
+        if price < self.simulator_price_min:
+            return False, f"Price ${price:.2f} below min ${self.simulator_price_min:.2f}"
+        
+        if price > self.simulator_price_max:
+            return False, f"Price ${price:.2f} above max ${self.simulator_price_max:.2f}"
+        
+        return True, None
+    
+    def _validate_simulator_spread(self, spread: float) -> Tuple[bool, Optional[str]]:
+        """Validate simulator spread is realistic
+        
+        Args:
+            spread: Spread value to validate
+            
+        Returns:
+            Tuple of (is_valid, error_message)
+        """
+        if spread < self.simulator_spread_min:
+            return False, f"Spread ${spread:.2f} below min ${self.simulator_spread_min:.2f}"
+        
+        if spread > self.simulator_spread_max:
+            return False, f"Spread ${spread:.2f} above max ${self.simulator_spread_max:.2f}"
+        
+        return True, None
+    
+    def _validate_timestamp_monotonicity(self, new_timestamp: datetime) -> Tuple[bool, Optional[str]]:
+        """Validate that timestamp is always moving forward
+        
+        Args:
+            new_timestamp: New timestamp to validate
+            
+        Returns:
+            Tuple of (is_valid, error_message)
+        """
+        if self.simulator_last_timestamp is None:
+            return True, None
+        
+        if new_timestamp <= self.simulator_last_timestamp:
+            return False, (
+                f"Timestamp not advancing: new={new_timestamp.isoformat()} "
+                f"<= last={self.simulator_last_timestamp.isoformat()}"
+            )
+        
+        return True, None
     
     async def _run_simulator(self):
+        """Run price simulator with realistic XAU/USD data validation"""
         logger.info("Starting price simulator (fallback mode)")
-        logger.info(f"Base price: ${self.base_price}, Volatility: ±${self.price_volatility}")
+        logger.info(
+            f"Simulator config: base_price=${self.base_price:.2f}, volatility=±${self.price_volatility:.2f}, "
+            f"price_range=[${self.simulator_price_min:.2f}-${self.simulator_price_max:.2f}], "
+            f"spread_range=[${self.simulator_spread_min:.2f}-${self.simulator_spread_max:.2f}]"
+        )
+        
+        tick_count = 0
+        validation_errors = 0
         
         while self.use_simulator:
             try:
-                spread = 0.30 + random.uniform(0, 0.20)
+                spread = self.simulator_spread_min + random.uniform(0, self.simulator_spread_max - self.simulator_spread_min)
                 
                 price_change = random.uniform(-self.price_volatility, self.price_volatility)
                 mid_price = self.base_price + price_change
                 
-                self.current_bid = mid_price - (spread / 2)
-                self.current_ask = mid_price + (spread / 2)
-                self.current_timestamp = datetime.now(pytz.UTC)
-                self.current_quote = mid_price
+                mid_price = max(self.simulator_price_min, min(mid_price, self.simulator_price_max))
                 
-                if not is_valid_price(self.current_bid) or not is_valid_price(self.current_ask):
-                    logger.warning("Simulator generated invalid prices, skipping tick")
-                    await asyncio.sleep(0.5)
+                current_bid = mid_price - (spread / 2)
+                current_ask = mid_price + (spread / 2)
+                new_timestamp = datetime.now(pytz.UTC)
+                
+                is_valid_bid, bid_error = self._validate_simulator_price(current_bid)
+                is_valid_ask, ask_error = self._validate_simulator_price(current_ask)
+                is_valid_spread, spread_error = self._validate_simulator_spread(spread)
+                is_valid_ts, ts_error = self._validate_timestamp_monotonicity(new_timestamp)
+                
+                if not is_valid_bid:
+                    logger.warning(f"Simulator bid validation failed: {bid_error}")
+                    validation_errors += 1
+                    await asyncio.sleep(0.1)
                     continue
+                
+                if not is_valid_ask:
+                    logger.warning(f"Simulator ask validation failed: {ask_error}")
+                    validation_errors += 1
+                    await asyncio.sleep(0.1)
+                    continue
+                
+                if not is_valid_spread:
+                    logger.debug(f"Simulator spread out of range, clamping: {spread_error}")
+                    spread = max(self.simulator_spread_min, min(spread, self.simulator_spread_max))
+                    current_bid = mid_price - (spread / 2)
+                    current_ask = mid_price + (spread / 2)
+                
+                if not is_valid_ts:
+                    logger.warning(f"Simulator timestamp validation failed: {ts_error}")
+                    await asyncio.sleep(0.05)
+                    continue
+                
+                self.current_bid = current_bid
+                self.current_ask = current_ask
+                self.current_timestamp = new_timestamp
+                self.current_quote = mid_price
+                self.simulator_last_timestamp = new_timestamp
                 
                 if not self._loading_from_db:
                     self.m1_builder.add_tick(self.current_bid, self.current_ask, self.current_timestamp)
@@ -1029,9 +1365,14 @@ class MarketDataClient:
                 }
                 await self._broadcast_tick(tick_data)
                 
+                tick_count += 1
                 self._log_tick_sample(self.current_bid, self.current_ask, self.current_quote, spread, mode="simulator")
                 
-                self.base_price = mid_price
+                drift = random.uniform(-0.5, 0.5)
+                self.base_price = max(
+                    self.simulator_price_min + self.price_volatility,
+                    min(mid_price + drift, self.simulator_price_max - self.price_volatility)
+                )
                 
                 await asyncio.sleep(0.5)
                 
@@ -1039,7 +1380,10 @@ class MarketDataClient:
                 logger.error(f"Simulator error: {e}")
                 await asyncio.sleep(5)
         
-        logger.info("Price simulator stopped")
+        logger.info(
+            f"Price simulator stopped: {tick_count} ticks generated, "
+            f"{validation_errors} validation errors"
+        )
     
     async def _on_message(self, message: str):
         """Process incoming WebSocket message with validation and NaN handling"""

@@ -8,10 +8,15 @@ from typing import Optional, Tuple
 import json
 import asyncio
 import gc
+import time
 from concurrent.futures import ThreadPoolExecutor
 from bot.logger import setup_logger
 
 logger = setup_logger('ChartGenerator')
+
+FALLBACK_CHART_TIMEOUT = 60.0
+FALLBACK_SHUTDOWN_TIMEOUT = 30.0
+TIMEOUT_WARNING_THRESHOLD = 0.8
 
 class ChartError(Exception):
     """Base exception for chart generation errors"""
@@ -60,9 +65,6 @@ def validate_chart_data(df: pd.DataFrame) -> Tuple[bool, Optional[str]]:
         return False, f"Validation error: {str(e)}"
 
 class ChartGenerator:
-    DEFAULT_CHART_TIMEOUT = 60.0
-    DEFAULT_SHUTDOWN_TIMEOUT = 30.0
-    
     def __init__(self, config):
         self.config = config
         self.chart_dir = 'charts'
@@ -77,7 +79,18 @@ class ChartGenerator:
         self._task_lock = asyncio.Lock()
         self._future_lock = asyncio.Lock()
         self._timed_out_tasks: set = set()
-        logger.info(f"ChartGenerator initialized dengan max_workers={max_workers} (FREE_TIER_MODE={self.config.FREE_TIER_MODE})")
+        
+        self.chart_timeout = getattr(config, 'DEFAULT_CHART_TIMEOUT', None)
+        if self.chart_timeout is None:
+            self.chart_timeout = FALLBACK_CHART_TIMEOUT
+            logger.debug(f"DEFAULT_CHART_TIMEOUT not in config, using fallback: {FALLBACK_CHART_TIMEOUT}s")
+        
+        self.shutdown_timeout = getattr(config, 'DEFAULT_SHUTDOWN_TIMEOUT', None)
+        if self.shutdown_timeout is None:
+            self.shutdown_timeout = FALLBACK_SHUTDOWN_TIMEOUT
+            logger.debug(f"DEFAULT_SHUTDOWN_TIMEOUT not in config, using fallback: {FALLBACK_SHUTDOWN_TIMEOUT}s")
+        
+        logger.info(f"ChartGenerator initialized: max_workers={max_workers}, chart_timeout={self.chart_timeout}s, shutdown_timeout={self.shutdown_timeout}s (FREE_TIER_MODE={self.config.FREE_TIER_MODE})")
     
     def generate_chart(self, df: pd.DataFrame, signal: Optional[dict] = None,
                       timeframe: str = 'M1') -> Optional[str]:
@@ -276,7 +289,9 @@ class ChartGenerator:
         task_id = None
         future = None
         future_id = None
-        effective_timeout = timeout if timeout is not None else self.DEFAULT_CHART_TIMEOUT
+        effective_timeout = timeout if timeout is not None else self.chart_timeout
+        start_time = time.monotonic()
+        warning_threshold_seconds = effective_timeout * TIMEOUT_WARNING_THRESHOLD
         
         try:
             if self._shutdown_requested:
@@ -310,14 +325,22 @@ class ChartGenerator:
                 self._active_futures[future_id] = future
             
             result = await asyncio.wait_for(future, timeout=effective_timeout)
+            
+            elapsed_time = time.monotonic() - start_time
+            if elapsed_time > warning_threshold_seconds:
+                pct = (elapsed_time / effective_timeout) * 100
+                logger.warning(f"⚠️ Chart generation took {elapsed_time:.2f}s ({pct:.1f}% of {effective_timeout}s timeout) - consider optimizing or increasing timeout")
+            
             return result
             
         except asyncio.TimeoutError:
-            logger.warning(f"Chart generation timed out after {effective_timeout}s")
+            elapsed_time = time.monotonic() - start_time
+            logger.warning(f"Chart generation timed out after {elapsed_time:.2f}s (limit: {effective_timeout}s)")
             
             if future is not None and future_id is not None:
                 async with self._future_lock:
                     self._timed_out_tasks.add(future_id)
+                    logger.debug(f"Added future {future_id} to timed_out_tasks, total: {len(self._timed_out_tasks)}")
                 
                 try:
                     if hasattr(future, 'cancel'):
@@ -327,7 +350,6 @@ class ChartGenerator:
                     logger.debug(f"Could not cancel future {future_id}: {cancel_err}")
                 
                 try:
-                    import gc
                     gc.collect()
                 except Exception:
                     pass
@@ -397,7 +419,7 @@ class ChartGenerator:
     
     def shutdown(self, timeout: Optional[float] = None):
         """Graceful synchronous shutdown dengan cleanup semua pending charts"""
-        effective_timeout = timeout if timeout is not None else self.DEFAULT_SHUTDOWN_TIMEOUT
+        effective_timeout = timeout if timeout is not None else self.shutdown_timeout
         
         try:
             logger.info(f"Shutting down ChartGenerator executor (timeout={effective_timeout}s)...")
@@ -407,6 +429,25 @@ class ChartGenerator:
             if pending_task_count > 0:
                 logger.info(f"Cancelling {pending_task_count} pending chart tasks...")
                 self._pending_tasks.clear()
+            
+            timed_out_count = len(self._timed_out_tasks)
+            if timed_out_count > 0:
+                logger.warning(f"⚠️ Found {timed_out_count} timed out tasks during shutdown: {list(self._timed_out_tasks)[:10]}{'...' if timed_out_count > 10 else ''}")
+                self._timed_out_tasks.clear()
+                logger.debug("Cleared timed out tasks set")
+            
+            active_futures_count = len(self._active_futures)
+            if active_futures_count > 0:
+                logger.info(f"Cleaning up {active_futures_count} active futures...")
+                for future_id, future in list(self._active_futures.items()):
+                    try:
+                        if hasattr(future, 'cancel'):
+                            future.cancel()
+                            logger.debug(f"Cancelled active future {future_id}")
+                    except Exception as cancel_err:
+                        logger.debug(f"Could not cancel future {future_id}: {cancel_err}")
+                self._active_futures.clear()
+                logger.debug("Cleared active futures dict")
             
             try:
                 self.executor.shutdown(wait=True, cancel_futures=True)
@@ -425,10 +466,16 @@ class ChartGenerator:
                 self._cleanup_pending_charts()
             except Exception as cleanup_error:
                 logger.error(f"Error in final cleanup: {cleanup_error}")
+            
+            try:
+                gc.collect()
+                logger.debug("gc.collect() completed after shutdown")
+            except Exception as gc_error:
+                logger.debug(f"gc.collect() error: {gc_error}")
     
     async def shutdown_async(self, timeout: Optional[float] = None):
         """Graceful async shutdown dengan timeout dan cleanup semua pending charts"""
-        effective_timeout = timeout if timeout is not None else self.DEFAULT_SHUTDOWN_TIMEOUT
+        effective_timeout = timeout if timeout is not None else self.shutdown_timeout
         
         try:
             logger.info(f"Shutting down ChartGenerator (async, timeout={effective_timeout}s)...")
@@ -439,6 +486,26 @@ class ChartGenerator:
                 if pending_count > 0:
                     logger.info(f"Cancelling {pending_count} pending chart tasks...")
                 self._pending_tasks.clear()
+            
+            async with self._future_lock:
+                timed_out_count = len(self._timed_out_tasks)
+                if timed_out_count > 0:
+                    logger.warning(f"⚠️ Found {timed_out_count} timed out tasks during shutdown: {list(self._timed_out_tasks)[:10]}{'...' if timed_out_count > 10 else ''}")
+                    self._timed_out_tasks.clear()
+                    logger.debug("Cleared timed out tasks set (async)")
+                
+                active_futures_count = len(self._active_futures)
+                if active_futures_count > 0:
+                    logger.info(f"Cleaning up {active_futures_count} active futures (async)...")
+                    for future_id, future in list(self._active_futures.items()):
+                        try:
+                            if hasattr(future, 'cancel'):
+                                future.cancel()
+                                logger.debug(f"Cancelled active future {future_id}")
+                        except Exception as cancel_err:
+                            logger.debug(f"Could not cancel future {future_id}: {cancel_err}")
+                    self._active_futures.clear()
+                    logger.debug("Cleared active futures dict (async)")
             
             loop = asyncio.get_running_loop()
             try:
@@ -470,6 +537,12 @@ class ChartGenerator:
                 self._cleanup_pending_charts()
             except Exception as cleanup_error:
                 logger.error(f"Error in final cleanup (async): {cleanup_error}")
+            
+            try:
+                gc.collect()
+                logger.debug("gc.collect() completed after async shutdown")
+            except Exception as gc_error:
+                logger.debug(f"gc.collect() error (async): {gc_error}")
     
     def _cleanup_pending_charts(self):
         """Cleanup semua pending chart files dengan try-finally untuk memastikan cleanup"""
@@ -580,16 +653,20 @@ class ChartGenerator:
             chart_count = len([f for f in os.listdir(self.chart_dir) if f.endswith('.png')])
             pending_chart_count = len(self._pending_charts)
             pending_task_count = len(self._pending_tasks)
+            timed_out_count = len(self._timed_out_tasks)
+            active_futures_count = len(self._active_futures)
             
             return {
                 'chart_dir': self.chart_dir,
                 'total_charts': chart_count,
                 'pending_charts': pending_chart_count,
                 'pending_tasks': pending_task_count,
+                'timed_out_tasks': timed_out_count,
+                'active_futures': active_futures_count,
                 'shutdown_requested': self._shutdown_requested,
                 'free_tier_mode': self.config.FREE_TIER_MODE,
-                'default_chart_timeout': self.DEFAULT_CHART_TIMEOUT,
-                'default_shutdown_timeout': self.DEFAULT_SHUTDOWN_TIMEOUT
+                'chart_timeout': self.chart_timeout,
+                'shutdown_timeout': self.shutdown_timeout
             }
         except Exception as e:
             logger.error(f"Error getting chart stats: {e}")

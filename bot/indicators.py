@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 from typing import Dict, Optional, Union
+from numpy.typing import NDArray
 
 def validate_series(series: pd.Series, min_length: int = 1, fill_value: float = 0.0) -> pd.Series:
     """
@@ -29,23 +30,56 @@ def validate_series(series: pd.Series, min_length: int = 1, fill_value: float = 
     return series.fillna(fill_value)
 
 
-def safe_divide(numerator: pd.Series, denominator: pd.Series, fill_value: float = 0.0) -> pd.Series:
+def _ensure_series(data: Union[pd.Series, pd.DataFrame, np.ndarray, float, int], 
+                   index: Optional[pd.Index] = None) -> pd.Series:
+    """
+    Convert various data types to pandas Series.
+    
+    Args:
+        data: Input data (Series, DataFrame, ndarray, float, or int)
+        index: Optional index for the resulting Series
+    
+    Returns:
+        pandas Series
+    """
+    if isinstance(data, pd.Series):
+        return data
+    elif isinstance(data, pd.DataFrame):
+        if len(data.columns) == 1:
+            return pd.Series(data.iloc[:, 0], index=data.index)
+        return pd.Series(data.iloc[:, 0], index=data.index)
+    elif isinstance(data, np.ndarray):
+        return pd.Series(data, index=index)
+    elif isinstance(data, (float, int)):
+        if index is not None:
+            return pd.Series([data] * len(index), index=index)
+        return pd.Series([data])
+    else:
+        return pd.Series([data])
+
+
+def safe_divide(numerator: Union[pd.Series, pd.DataFrame, np.ndarray, float], 
+                denominator: Union[pd.Series, pd.DataFrame, np.ndarray, float], 
+                fill_value: float = 0.0) -> pd.Series:
     """
     Safely divide two Series, handling division by zero and NaN values.
     
     Args:
-        numerator: Numerator Series
-        denominator: Denominator Series
+        numerator: Numerator (Series, DataFrame, ndarray, or float)
+        denominator: Denominator (Series, DataFrame, ndarray, or float)
         fill_value: Value to use when division is undefined
     
     Returns:
         Result Series with safe division
     """
+    num_series = _ensure_series(numerator)
+    denom_series = _ensure_series(denominator, index=num_series.index if hasattr(num_series, 'index') else None)
+    
     with np.errstate(divide='ignore', invalid='ignore'):
-        result = numerator / denominator
+        result = num_series / denom_series
         result = result.replace([np.inf, -np.inf], fill_value)
         result = result.fillna(fill_value)
-    return result
+    return pd.Series(result)
 
 
 def safe_series_operation(series: pd.Series, operation: str = 'value', 
@@ -70,19 +104,19 @@ def safe_series_operation(series: pd.Series, operation: str = 'value',
             if abs(index) > len(series):
                 return default
             val = series.iloc[index]
-            return default if pd.isna(val) else float(val)
+            return default if bool(pd.isna(val)) else float(val)
         elif operation == 'mean':
             val = series.mean()
-            return default if pd.isna(val) else float(val)
+            return default if val is None or (isinstance(val, float) and np.isnan(val)) else float(val)
         elif operation == 'sum':
             val = series.sum()
-            return default if pd.isna(val) else float(val)
+            return default if val is None or (isinstance(val, float) and np.isnan(val)) else float(val)
         elif operation == 'min':
             val = series.min()
-            return default if pd.isna(val) else float(val)
+            return default if val is None or (isinstance(val, float) and np.isnan(val)) else float(val)
         elif operation == 'max':
             val = series.max()
-            return default if pd.isna(val) else float(val)
+            return default if val is None or (isinstance(val, float) and np.isnan(val)) else float(val)
         else:
             return default
     except (IndexError, KeyError, TypeError):
@@ -144,7 +178,7 @@ class IndicatorEngine:
         if column not in df.columns:
             return pd.Series([fill_value] * len(df), index=df.index)
         
-        return df[column].fillna(fill_value)
+        return pd.Series(df[column].fillna(fill_value))
     
     def calculate_ema(self, df: pd.DataFrame, period: int) -> pd.Series:
         """Calculate Exponential Moving Average with null handling."""
@@ -156,7 +190,7 @@ class IndicatorEngine:
             return pd.Series([0.0] * len(close), index=df.index)
         
         result = close.ewm(span=period, adjust=False).mean()
-        return result.fillna(0.0)
+        return pd.Series(result.fillna(0.0))
     
     def calculate_rsi(self, df: pd.DataFrame, period: int) -> pd.Series:
         """Calculate RSI with proper null handling for division operations."""
@@ -176,16 +210,16 @@ class IndicatorEngine:
         avg_gain = gain.rolling(window=period, min_periods=1).mean()
         avg_loss = loss.rolling(window=period, min_periods=1).mean()
         
-        avg_gain = avg_gain.fillna(0.0)
-        avg_loss = avg_loss.fillna(0.0)
+        avg_gain = pd.Series(avg_gain).fillna(0.0)
+        avg_loss = pd.Series(avg_loss).fillna(0.0)
         
         rs = safe_divide(avg_gain, avg_loss, fill_value=0.0)
         
         rsi = 100 - (100 / (1 + rs))
-        rsi = rsi.fillna(50.0)
+        rsi = pd.Series(rsi).fillna(50.0)
         rsi = rsi.clip(0, 100)
         
-        return rsi
+        return pd.Series(rsi)
     
     def calculate_stochastic(self, df: pd.DataFrame, k_period: int, d_period: int, smooth_k: int) -> tuple:
         """Calculate Stochastic oscillator with null handling."""
@@ -240,12 +274,12 @@ class IndicatorEngine:
         low_close = (low - prev_close).abs()
         
         tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-        tr = tr.fillna(0.0)
+        tr = pd.Series(tr).fillna(0.0)
         
         atr = tr.rolling(window=period, min_periods=1).mean()
-        atr = atr.fillna(0.0)
+        atr = pd.Series(atr).fillna(0.0)
         
-        return atr
+        return pd.Series(atr)
     
     def calculate_volume_average(self, df: pd.DataFrame, period: int = 20) -> pd.Series:
         """Calculate volume average with null handling."""
@@ -255,10 +289,11 @@ class IndicatorEngine:
         volume = self._get_column_series(df, 'volume')
         
         if len(volume) < period:
-            return volume.rolling(window=len(volume), min_periods=1).mean().fillna(0.0)
+            result = volume.rolling(window=len(volume), min_periods=1).mean()
+            return pd.Series(result).fillna(0.0)
         
         result = volume.rolling(window=period, min_periods=1).mean()
-        return result.fillna(0.0)
+        return pd.Series(result).fillna(0.0)
     
     def calculate_twin_range_filter(self, df: pd.DataFrame, period: int = 27, multiplier: float = 2.0) -> tuple:
         """

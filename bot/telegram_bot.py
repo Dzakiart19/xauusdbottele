@@ -1,7 +1,10 @@
 import asyncio
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
-from telegram.error import TelegramError, NetworkError, TimedOut, RetryAfter, BadRequest
+from telegram.error import (
+    TelegramError, NetworkError, TimedOut, RetryAfter, BadRequest,
+    Forbidden, Conflict, ChatMigrated, InvalidToken
+)
 from telegram import error as telegram_error
 from datetime import datetime, timedelta
 import pytz
@@ -118,7 +121,15 @@ def sanitize_command_argument(arg: str, max_length: int = 100) -> str:
     return sanitized
 
 def retry_on_telegram_error(max_retries: int = 3, initial_delay: float = 1.0):
-    """Decorator to retry Telegram API calls with exponential backoff"""
+    """Decorator to retry Telegram API calls with exponential backoff.
+    
+    Error handling strategy:
+    - Transient errors (NetworkError, TimedOut): Retry with exponential backoff
+    - Rate limit (RetryAfter): Wait for specified duration then retry
+    - Permanent errors (BadRequest, Forbidden): No retry, log and raise
+    - Auth errors (InvalidToken, Conflict): Critical alert, no retry
+    - Migration (ChatMigrated): Extract new chat ID and raise with info
+    """
     def decorator(func: Callable) -> Callable:
         @wraps(func)
         async def wrapper(*args, **kwargs) -> Any:
@@ -154,6 +165,27 @@ def retry_on_telegram_error(max_retries: int = 3, initial_delay: float = 1.0):
                     else:
                         logger.error(f"Max retries reached for {func.__name__} due to network error")
                         raise
+                
+                except BadRequest as e:
+                    logger.error(f"BadRequest in {func.__name__}: {e} - Invalid request, tidak akan retry")
+                    raise
+                
+                except Forbidden as e:
+                    logger.warning(f"Forbidden in {func.__name__}: {e} - User mungkin memblokir bot atau chat tidak dapat diakses")
+                    raise
+                
+                except ChatMigrated as e:
+                    new_chat_id = e.new_chat_id if hasattr(e, 'new_chat_id') else None
+                    logger.warning(f"ChatMigrated in {func.__name__}: Chat migrated to new ID: {new_chat_id}")
+                    raise
+                
+                except Conflict as e:
+                    logger.critical(f"🔴 CONFLICT in {func.__name__}: {e} - Multiple bot instances detected!")
+                    raise
+                
+                except InvalidToken as e:
+                    logger.critical(f"🔴 UNAUTHORIZED in {func.__name__}: {e} - Token tidak valid atau bot di-revoke!")
+                    raise
                         
                 except TelegramError as e:
                     logger.error(f"Telegram API error in {func.__name__}: {e}")
@@ -362,6 +394,250 @@ class TradingBot:
             else:
                 self.sent_signals_cache.clear()
                 logger.debug("Cleared all signal cache")
+    
+    async def _handle_forbidden_error(self, chat_id: int, error: Forbidden):
+        """Handle Forbidden error - user blocked bot or chat inaccessible.
+        
+        Actions:
+        - Remove chat from monitoring list
+        - Cancel monitoring task for this chat
+        - Clear any pending signals for this user
+        - Log the event for analytics
+        
+        Args:
+            chat_id: The chat ID that generated the error
+            error: The Forbidden exception
+        """
+        logger.warning(f"🚫 Forbidden error for chat {mask_user_id(chat_id)}: {error}")
+        
+        if chat_id in self.monitoring_chats:
+            self.monitoring_chats.remove(chat_id)
+            logger.info(f"Removed chat {mask_user_id(chat_id)} from monitoring list (user blocked bot)")
+        
+        task = self.monitoring_tasks.pop(chat_id, None)
+        if task and not task.done():
+            task.cancel()
+            try:
+                await asyncio.wait_for(task, timeout=2.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+            logger.info(f"Cancelled monitoring task for blocked chat {mask_user_id(chat_id)}")
+        
+        await self._clear_signal_cache(chat_id)
+        
+        if self.signal_session_manager:
+            try:
+                await self.signal_session_manager.end_session(
+                    chat_id, 
+                    reason='user_blocked', 
+                    notify=False
+                )
+            except Exception as e:
+                logger.debug(f"Could not end session for blocked user: {e}")
+        
+        if self.alert_system:
+            try:
+                await self.alert_system.send_alert(
+                    level='warning',
+                    title='User Blocked Bot',
+                    message=f"User {mask_user_id(chat_id)} telah memblokir bot atau chat tidak dapat diakses",
+                    context={'chat_id': chat_id, 'error': str(error)}
+                )
+            except Exception as e:
+                logger.debug(f"Could not send alert for blocked user: {e}")
+    
+    async def _handle_chat_migrated(self, old_chat_id: int, error: ChatMigrated) -> Optional[int]:
+        """Handle ChatMigrated error - group migrated to supergroup.
+        
+        Actions:
+        - Extract new chat ID from error
+        - Update monitoring list with new chat ID
+        - Update any active sessions/positions with new chat ID
+        - Return new chat ID for caller to retry operation
+        
+        Args:
+            old_chat_id: The old chat ID that triggered migration
+            error: The ChatMigrated exception containing new_chat_id
+            
+        Returns:
+            int or None: The new chat ID if available
+        """
+        new_chat_id = getattr(error, 'new_chat_id', None)
+        logger.warning(f"📤 Chat migrated: {mask_user_id(old_chat_id)} -> {mask_user_id(new_chat_id) if new_chat_id else 'unknown'}")
+        
+        if not new_chat_id:
+            logger.error(f"ChatMigrated error without new_chat_id for {mask_user_id(old_chat_id)}")
+            return None
+        
+        if old_chat_id in self.monitoring_chats:
+            idx = self.monitoring_chats.index(old_chat_id)
+            self.monitoring_chats[idx] = new_chat_id
+            logger.info(f"Updated monitoring list: {mask_user_id(old_chat_id)} -> {mask_user_id(new_chat_id)}")
+        
+        old_task = self.monitoring_tasks.pop(old_chat_id, None)
+        if old_task:
+            if not old_task.done():
+                old_task.cancel()
+                try:
+                    await asyncio.wait_for(old_task, timeout=2.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    pass
+            new_task = asyncio.create_task(self._monitoring_loop(new_chat_id))
+            self.monitoring_tasks[new_chat_id] = new_task
+            logger.info(f"Created new monitoring task for migrated chat {mask_user_id(new_chat_id)}")
+        
+        if self.signal_session_manager:
+            try:
+                await self.signal_session_manager.migrate_user_sessions(old_chat_id, new_chat_id)
+            except Exception as e:
+                logger.warning(f"Could not migrate sessions for chat migration: {e}")
+        
+        if self.alert_system:
+            try:
+                await self.alert_system.send_alert(
+                    level='info',
+                    title='Chat Migrated',
+                    message=f"Chat {mask_user_id(old_chat_id)} migrated to {mask_user_id(new_chat_id)}",
+                    context={'old_chat_id': old_chat_id, 'new_chat_id': new_chat_id}
+                )
+            except Exception as e:
+                logger.debug(f"Could not send migration alert: {e}")
+        
+        return new_chat_id
+    
+    async def _handle_unauthorized_error(self, error: InvalidToken):
+        """Handle InvalidToken error - invalid or revoked bot token.
+        
+        This is a CRITICAL error that requires immediate attention.
+        
+        Actions:
+        - Log critical error
+        - Send critical alert (if possible through alternative channels)
+        - Stop all monitoring and cleanup
+        - Set shutdown flag
+        
+        Args:
+            error: The InvalidToken exception
+        """
+        logger.critical(f"🔴 CRITICAL: InvalidToken error - Bot token invalid or revoked: {error}")
+        
+        self._is_shutting_down = True
+        
+        if self.alert_system:
+            try:
+                await self.alert_system.send_critical_alert(
+                    title='🔴 BOT TOKEN INVALID',
+                    message=f"Bot token tidak valid atau telah di-revoke. Bot akan berhenti.\nError: {error}",
+                    context={'error': str(error), 'timestamp': datetime.now().isoformat()}
+                )
+            except Exception as e:
+                logger.error(f"Could not send critical alert for unauthorized error: {e}")
+        
+        if self.error_handler:
+            try:
+                await self.error_handler.handle_critical_error(
+                    error_type='UNAUTHORIZED',
+                    error=error,
+                    context={'action': 'bot_shutdown_required'}
+                )
+            except Exception as e:
+                logger.error(f"Error handler failed for unauthorized error: {e}")
+        
+        logger.critical("🛑 Initiating emergency shutdown due to unauthorized error...")
+        await self.stop_background_cleanup_tasks()
+    
+    async def _handle_conflict_error(self, error: Conflict):
+        """Handle Conflict error - multiple bot instances detected.
+        
+        This is a CRITICAL error indicating duplicate bot instances.
+        
+        Actions:
+        - Log critical error with instance info
+        - Send alert to admins
+        - Gracefully stop this instance to avoid conflicts
+        
+        Args:
+            error: The Conflict exception
+        """
+        logger.critical(f"🔴 CRITICAL: Conflict error - Multiple bot instances detected: {error}")
+        
+        if self.alert_system:
+            try:
+                await self.alert_system.send_critical_alert(
+                    title='🔴 BOT INSTANCE CONFLICT',
+                    message=f"Multiple bot instances detected! Ini dapat menyebabkan behavior yang tidak konsisten.\nError: {error}",
+                    context={
+                        'error': str(error),
+                        'timestamp': datetime.now().isoformat(),
+                        'instance_lock_file': self.instance_lock_file
+                    }
+                )
+            except Exception as e:
+                logger.error(f"Could not send critical alert for conflict error: {e}")
+        
+        if self.error_handler:
+            try:
+                await self.error_handler.handle_critical_error(
+                    error_type='CONFLICT',
+                    error=error,
+                    context={'action': 'check_other_instances'}
+                )
+            except Exception as e:
+                logger.error(f"Error handler failed for conflict error: {e}")
+        
+        logger.critical("🛑 This instance will stop to avoid conflicts...")
+        self._is_shutting_down = True
+        await self.stop_background_cleanup_tasks()
+    
+    async def _handle_bad_request(self, chat_id: int, error: BadRequest, context: str = ""):
+        """Handle BadRequest error - invalid request parameters.
+        
+        This error should NOT be retried as it indicates a programming error
+        or invalid input that won't change on retry.
+        
+        Actions:
+        - Log detailed error with context
+        - Track for debugging
+        - Optionally notify developers
+        
+        Args:
+            chat_id: The chat ID involved (if any)
+            error: The BadRequest exception
+            context: Additional context about what operation failed
+        """
+        error_message = str(error)
+        logger.error(f"❌ BadRequest for chat {mask_user_id(chat_id)}: {error_message} (context: {context})")
+        
+        known_bad_requests = {
+            'message is not modified': 'info',
+            'message to edit not found': 'warning',
+            'chat not found': 'warning',
+            'user not found': 'warning',
+            'message text is empty': 'error',
+            'can\'t parse entities': 'error',
+            'wrong file identifier': 'error',
+        }
+        
+        log_level = 'error'
+        for pattern, level in known_bad_requests.items():
+            if pattern.lower() in error_message.lower():
+                log_level = level
+                break
+        
+        if log_level == 'info':
+            logger.info(f"BadRequest (expected): {error_message}")
+        elif log_level == 'warning':
+            logger.warning(f"BadRequest (expected): {error_message}")
+        else:
+            if self.error_handler:
+                try:
+                    await self.error_handler.track_error(
+                        error_type='BAD_REQUEST',
+                        error=error,
+                        context={'chat_id': chat_id, 'operation': context}
+                    )
+                except Exception as e:
+                    logger.debug(f"Could not track bad request error: {e}")
     
     async def start_background_cleanup_tasks(self):
         """Mulai background tasks untuk cleanup cache, dashboards, dan pending charts"""
@@ -934,6 +1210,18 @@ class TradingBot:
                 await update.message.reply_text("⏳ Koneksi timeout, silakan coba lagi.")
             except (TelegramError, asyncio.CancelledError):
                 pass
+        except BadRequest as e:
+            await self._handle_bad_request(update.effective_chat.id, e, context="start_command")
+        except Forbidden as e:
+            await self._handle_forbidden_error(update.effective_chat.id, e)
+        except ChatMigrated as e:
+            new_chat_id = await self._handle_chat_migrated(update.effective_chat.id, e)
+            if new_chat_id:
+                logger.info(f"Chat migrated in start command, new ID: {new_chat_id}")
+        except Conflict as e:
+            await self._handle_conflict_error(e)
+        except InvalidToken as e:
+            await self._handle_unauthorized_error(e)
         except TelegramError as e:
             logger.error(f"Telegram error in start command: {e}")
             try:
@@ -981,6 +1269,16 @@ class TradingBot:
             logger.warning(f"Rate limit in help command: retry after {e.retry_after}s")
         except (TimedOut, NetworkError) as e:
             logger.warning(f"Network/timeout error in help command: {e}")
+        except BadRequest as e:
+            await self._handle_bad_request(update.effective_chat.id, e, context="help_command")
+        except Forbidden as e:
+            await self._handle_forbidden_error(update.effective_chat.id, e)
+        except ChatMigrated as e:
+            await self._handle_chat_migrated(update.effective_chat.id, e)
+        except Conflict as e:
+            await self._handle_conflict_error(e)
+        except InvalidToken as e:
+            await self._handle_unauthorized_error(e)
         except TelegramError as e:
             logger.error(f"Telegram error in help command: {e}")
             try:
@@ -1031,6 +1329,18 @@ class TradingBot:
                 await update.message.reply_text("⏳ Koneksi timeout, silakan coba lagi.")
             except (TelegramError, asyncio.CancelledError):
                 pass
+        except BadRequest as e:
+            await self._handle_bad_request(update.effective_chat.id, e, context="monitor_command")
+        except Forbidden as e:
+            await self._handle_forbidden_error(update.effective_chat.id, e)
+        except ChatMigrated as e:
+            new_chat_id = await self._handle_chat_migrated(update.effective_chat.id, e)
+            if new_chat_id:
+                logger.info(f"Chat migrated in monitor command, monitoring new chat: {new_chat_id}")
+        except Conflict as e:
+            await self._handle_conflict_error(e)
+        except InvalidToken as e:
+            await self._handle_unauthorized_error(e)
         except TelegramError as e:
             logger.error(f"Telegram error in monitor command: {e}")
             try:
@@ -1097,6 +1407,16 @@ class TradingBot:
                 await update.message.reply_text("⏳ Koneksi timeout, silakan coba lagi.")
             except (TelegramError, asyncio.CancelledError):
                 pass
+        except BadRequest as e:
+            await self._handle_bad_request(update.effective_chat.id, e, context="stopmonitor_command")
+        except Forbidden as e:
+            await self._handle_forbidden_error(update.effective_chat.id, e)
+        except ChatMigrated as e:
+            await self._handle_chat_migrated(update.effective_chat.id, e)
+        except Conflict as e:
+            await self._handle_conflict_error(e)
+        except InvalidToken as e:
+            await self._handle_unauthorized_error(e)
         except TelegramError as e:
             logger.error(f"Telegram error in stopmonitor command: {e}")
             try:
@@ -1266,6 +1586,29 @@ class TradingBot:
                     break
                 except ConnectionError as e:
                     logger.warning(f"Connection error dalam monitoring loop: {e}, retry in {retry_delay}s")
+                    await asyncio.sleep(retry_delay)
+                    retry_delay = min(retry_delay * 2, max_retry_delay)
+                except Forbidden as e:
+                    logger.warning(f"Forbidden error in monitoring loop for {mask_user_id(chat_id)}: {e}")
+                    await self._handle_forbidden_error(chat_id, e)
+                    break
+                except ChatMigrated as e:
+                    new_chat_id = await self._handle_chat_migrated(chat_id, e)
+                    if new_chat_id:
+                        logger.info(f"Monitoring loop: chat migrated {mask_user_id(chat_id)} -> {mask_user_id(new_chat_id)}")
+                    break
+                except Conflict as e:
+                    await self._handle_conflict_error(e)
+                    break
+                except InvalidToken as e:
+                    await self._handle_unauthorized_error(e)
+                    break
+                except BadRequest as e:
+                    await self._handle_bad_request(chat_id, e, context="monitoring_loop")
+                    await asyncio.sleep(retry_delay)
+                    retry_delay = min(retry_delay * 2, max_retry_delay)
+                except (TimedOut, NetworkError) as e:
+                    logger.warning(f"Network/Timeout error in monitoring loop for {mask_user_id(chat_id)}: {e}")
                     await asyncio.sleep(retry_delay)
                     retry_delay = min(retry_delay * 2, max_retry_delay)
                 except Exception as e:
@@ -1449,6 +1792,31 @@ class TradingBot:
                 if self.app and self.app.bot:
                     try:
                         signal_message = await self._send_telegram_message(chat_id, msg, parse_mode='Markdown', timeout=30.0)
+                    except Forbidden as e:
+                        logger.warning(f"User blocked bot, cannot send signal: {e}")
+                        await self._handle_forbidden_error(chat_id, e)
+                        return
+                    except ChatMigrated as e:
+                        new_chat_id = await self._handle_chat_migrated(chat_id, e)
+                        if new_chat_id:
+                            try:
+                                signal_message = await self._send_telegram_message(new_chat_id, msg, parse_mode='Markdown', timeout=30.0)
+                                chat_id = new_chat_id
+                            except Exception as retry_error:
+                                logger.error(f"Failed to send signal to migrated chat: {retry_error}")
+                    except BadRequest as e:
+                        await self._handle_bad_request(chat_id, e, context="send_signal_message")
+                        try:
+                            fallback_msg = f"🚨 SINYAL {signal['signal']} @${signal['entry_price']:.2f} | SL: ${signal['stop_loss']:.2f} | TP: ${signal['take_profit']:.2f}"
+                            signal_message = await self._send_telegram_message(chat_id, fallback_msg, parse_mode=None, timeout=15.0)
+                        except Exception as fallback_error:
+                            logger.error(f"Fallback message also failed: {fallback_error}")
+                    except Conflict as e:
+                        await self._handle_conflict_error(e)
+                        return
+                    except InvalidToken as e:
+                        await self._handle_unauthorized_error(e)
+                        return
                     except (TimedOut, NetworkError, TelegramError) as e:
                         logger.error(f"Failed to send signal message: {e}")
                         try:
@@ -1476,7 +1844,6 @@ class TradingBot:
                                 if chart_path:
                                     try:
                                         await self._send_telegram_photo(chat_id, chart_path, timeout=60.0)
-                                        # Mark photo as sent in session to prevent duplicates
                                         if self.signal_session_manager:
                                             await self.signal_session_manager.update_session(
                                                 user_id, 
@@ -1484,9 +1851,25 @@ class TradingBot:
                                                 chart_path=chart_path
                                             )
                                         logger.info(f"📸 Chart sent successfully for user {mask_user_id(user_id)}")
+                                    except Forbidden as e:
+                                        logger.warning(f"User blocked bot, cannot send chart: {e}")
+                                        if self.signal_session_manager:
+                                            await self.signal_session_manager.update_session(user_id, photo_sent=True)
+                                    except ChatMigrated as e:
+                                        new_chat_id = await self._handle_chat_migrated(chat_id, e)
+                                        if new_chat_id:
+                                            try:
+                                                await self._send_telegram_photo(new_chat_id, chart_path, timeout=60.0)
+                                                if self.signal_session_manager:
+                                                    await self.signal_session_manager.update_session(user_id, photo_sent=True, chart_path=chart_path)
+                                            except Exception:
+                                                pass
+                                    except BadRequest as e:
+                                        await self._handle_bad_request(chat_id, e, context="send_chart_photo")
+                                        if self.signal_session_manager:
+                                            await self.signal_session_manager.update_session(user_id, photo_sent=True)
                                     except (TimedOut, NetworkError, TelegramError) as e:
                                         logger.warning(f"Failed to send chart: {e}. Signal sent successfully.")
-                                        # Still mark as attempted to prevent retry spam
                                         if self.signal_session_manager:
                                             await self.signal_session_manager.update_session(user_id, photo_sent=True)
                                     finally:
@@ -1598,6 +1981,17 @@ class TradingBot:
         except asyncio.CancelledError:
             logger.info(f"Dashboard start cancelled for user {mask_user_id(user_id)}")
             raise
+        except Forbidden as e:
+            logger.warning(f"User blocked bot, cannot start dashboard: {e}")
+            await self._handle_forbidden_error(chat_id, e)
+        except ChatMigrated as e:
+            await self._handle_chat_migrated(chat_id, e)
+        except BadRequest as e:
+            await self._handle_bad_request(chat_id, e, context="start_dashboard")
+        except Conflict as e:
+            await self._handle_conflict_error(e)
+        except InvalidToken as e:
+            await self._handle_unauthorized_error(e)
         except (TelegramError, NetworkError, TimedOut) as e:
             logger.error(f"Telegram error starting dashboard for user {mask_user_id(user_id)}: {e}")
         except Exception as e:
@@ -1741,7 +2135,26 @@ class TradingBot:
                 except asyncio.CancelledError:
                     logger.info(f"Dashboard update loop cancelled for user {mask_user_id(user_id)}")
                     break
-                    
+                except Forbidden as e:
+                    logger.warning(f"User blocked bot in dashboard loop: {e}")
+                    await self._handle_forbidden_error(chat_id, e)
+                    break
+                except ChatMigrated as e:
+                    new_chat_id = await self._handle_chat_migrated(chat_id, e)
+                    if new_chat_id:
+                        chat_id = new_chat_id
+                        logger.info(f"Dashboard: Updated chat ID to {mask_user_id(new_chat_id)}")
+                    else:
+                        break
+                except Conflict as e:
+                    await self._handle_conflict_error(e)
+                    break
+                except InvalidToken as e:
+                    await self._handle_unauthorized_error(e)
+                    break
+                except (TimedOut, NetworkError) as e:
+                    logger.warning(f"Network/Timeout error in dashboard update: {e}")
+                    await asyncio.sleep(5)
                 except Exception as e:
                     logger.error(f"Error in dashboard update loop: {type(e).__name__}: {e}")
                     await asyncio.sleep(5)
