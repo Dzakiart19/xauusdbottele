@@ -225,6 +225,7 @@ class TradingBot:
         self._dashboard_lock = asyncio.Lock()
         self._cache_cleanup_task: Optional[asyncio.Task] = None
         self._dashboard_cleanup_task: Optional[asyncio.Task] = None
+        self._cleanup_tasks_running: bool = False
         logger.info("✅ Two-phase anti-duplicate signal cache initialized (pending→confirmed)")
         
         import os
@@ -310,6 +311,8 @@ class TradingBot:
     
     async def start_background_cleanup_tasks(self):
         """Mulai background tasks untuk cleanup cache dan dashboards"""
+        self._cleanup_tasks_running = True
+        
         if self._cache_cleanup_task is None or self._cache_cleanup_task.done():
             self._cache_cleanup_task = asyncio.create_task(self._signal_cache_cleanup_loop())
             logger.info("✅ Signal cache cleanup background task started")
@@ -320,12 +323,15 @@ class TradingBot:
     
     async def stop_background_cleanup_tasks(self):
         """Stop background cleanup tasks"""
+        self._cleanup_tasks_running = False
+        
         if self._cache_cleanup_task and not self._cache_cleanup_task.done():
             self._cache_cleanup_task.cancel()
             try:
                 await self._cache_cleanup_task
             except asyncio.CancelledError:
                 pass
+            self._cache_cleanup_task = None
             logger.info("Signal cache cleanup task stopped")
         
         if self._dashboard_cleanup_task and not self._dashboard_cleanup_task.done():
@@ -334,6 +340,7 @@ class TradingBot:
                 await self._dashboard_cleanup_task
             except asyncio.CancelledError:
                 pass
+            self._dashboard_cleanup_task = None
             logger.info("Dashboard cleanup task stopped")
     
     async def _signal_cache_cleanup_loop(self):
@@ -341,8 +348,11 @@ class TradingBot:
         cleanup_interval = 60
         
         try:
-            while True:
+            while self._cleanup_tasks_running:
                 await asyncio.sleep(cleanup_interval)
+                
+                if not self._cleanup_tasks_running:
+                    break
                 
                 try:
                     cleaned = await self._cleanup_expired_cache_entries()
@@ -374,8 +384,11 @@ class TradingBot:
         max_dashboard_age_seconds = 3600
         
         try:
-            while True:
+            while self._cleanup_tasks_running:
                 await asyncio.sleep(cleanup_interval)
+                
+                if not self._cleanup_tasks_running:
+                    break
                 
                 try:
                     cleaned = await self._cleanup_stale_dashboards(max_dashboard_age_seconds)

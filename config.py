@@ -199,7 +199,27 @@ class Config:
                 'graceful_degradation_enabled': cls.OOM_GRACEFUL_DEGRADATION
             }
         except ImportError:
-            return {'status': 'unknown', 'error': 'psutil not available'}
+            try:
+                import resource
+                mem_usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+                mem_mb = mem_usage / 1024
+                
+                status = 'normal'
+                if mem_mb >= cls.MEMORY_CRITICAL_THRESHOLD_MB:
+                    status = 'critical'
+                elif mem_mb >= cls.MEMORY_WARNING_THRESHOLD_MB:
+                    status = 'warning'
+                
+                return {
+                    'memory_mb': round(mem_mb, 2),
+                    'warning_threshold': cls.MEMORY_WARNING_THRESHOLD_MB,
+                    'critical_threshold': cls.MEMORY_CRITICAL_THRESHOLD_MB,
+                    'status': status,
+                    'source': 'resource',
+                    'graceful_degradation_enabled': cls.OOM_GRACEFUL_DEGRADATION
+                }
+            except Exception:
+                return {'status': 'unknown', 'error': 'psutil/resource not available'}
         except Exception as e:
             return {'status': 'error', 'error': str(e)}
     

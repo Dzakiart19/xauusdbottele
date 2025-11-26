@@ -148,6 +148,9 @@ class RateLimitedLogger:
                 if now - t < self.window_seconds
             ]
             
+            if len(self._log_counts) > 1000:
+                self._cleanup_old_entries(now)
+            
             if len(self._log_counts[key]) >= self.max_similar_logs:
                 self._suppressed_counts[key] += 1
                 return False
@@ -160,6 +163,23 @@ class RateLimitedLogger:
                 self.logger.info(f"[Rate Limiter] Suppressed {suppressed} similar messages")
             
             return True
+    
+    def _cleanup_old_entries(self, now: float):
+        """Cleanup old entries dari log_counts dan suppressed_counts untuk mencegah memory growth"""
+        keys_to_remove = []
+        
+        for key in list(self._log_counts.keys()):
+            timestamps = self._log_counts[key]
+            active_timestamps = [t for t in timestamps if now - t < self.window_seconds]
+            
+            if not active_timestamps:
+                keys_to_remove.append(key)
+            else:
+                self._log_counts[key] = active_timestamps
+        
+        for key in keys_to_remove:
+            del self._log_counts[key]
+            self._suppressed_counts.pop(key, None)
     
     def debug(self, message: str, *args, **kwargs):
         if self._should_log(message):

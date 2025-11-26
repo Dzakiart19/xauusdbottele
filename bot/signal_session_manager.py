@@ -54,8 +54,12 @@ class SignalSessionManager:
             self._event_handlers[event].append(handler)
             logger.debug(f"Event handler registered for: {event}")
     
-    async def _emit_event(self, event: str, session: SignalSession):
-        """Emit event ke semua registered handlers dengan safe copy"""
+    async def _emit_event_outside_lock(self, event: str, session: SignalSession):
+        """
+        Emit event ke semua registered handlers.
+        PENTING: Method ini harus dipanggil DILUAR session_lock untuk mencegah deadlock.
+        """
+        handlers = []
         async with self._event_lock:
             handlers = list(self._event_handlers.get(event, []))
         
@@ -67,20 +71,6 @@ class SignalSessionManager:
                     handler(session)
             except Exception as e:
                 logger.error(f"Error in event handler for {event}: {e}")
-    
-    async def _emit_event_deferred(self, event: str, session: SignalSession):
-        """Queue event untuk emit setelah lock released (prevent deadlock)"""
-        self._pending_events.append((event, session))
-    
-    async def _process_pending_events(self):
-        """Process queued events setelah lock released"""
-        events_to_process = []
-        async with self._event_lock:
-            events_to_process = self._pending_events.copy()
-            self._pending_events.clear()
-        
-        for event, session in events_to_process:
-            await self._emit_event(event, session)
     
     async def can_create_signal(self, user_id: int, signal_source: str) -> tuple[bool, Optional[str]]:
         """
@@ -133,9 +123,9 @@ class SignalSessionManager:
             icon = "🤖" if signal_source == "auto" else "👤"
             logger.info(f"✅ Signal session created - User:{user_id} {icon} {signal_source.upper()} {signal_type}")
             
-            await self._emit_event('on_session_start', session)
-            
-            return session
+        await self._emit_event_outside_lock('on_session_start', session)
+        
+        return session
     
     async def update_session(self, user_id: int, **kwargs):
         """Update sesi yang sedang aktif"""
@@ -150,9 +140,9 @@ class SignalSessionManager:
                 if hasattr(session, key):
                     setattr(session, key, value)
             
-            await self._emit_event('on_session_update', session)
-            
-            return True
+        await self._emit_event_outside_lock('on_session_update', session)
+        
+        return True
     
     async def end_session(self, user_id: int, reason: str = "closed"):
         """Akhiri sesi sinyal dan cleanup chart jika ada - thread safe"""
@@ -180,7 +170,7 @@ class SignalSessionManager:
         if chart_path:
             await self._cleanup_chart_file(chart_path)
         
-        await self._emit_event('on_session_end', session)
+        await self._emit_event_outside_lock('on_session_end', session)
         
         return session
     
@@ -237,7 +227,7 @@ class SignalSessionManager:
         
         for session in sessions_to_end:
             try:
-                await self._emit_event('on_session_end', session)
+                await self._emit_event_outside_lock('on_session_end', session)
             except Exception as e:
                 logger.error(f"Error emitting end event for session {session.signal_id}: {e}")
         
