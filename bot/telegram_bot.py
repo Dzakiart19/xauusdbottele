@@ -183,6 +183,10 @@ def validate_chat_id(chat_id: Any) -> bool:
         return False
 
 class TradingBot:
+    MAX_CACHE_SIZE = 1000
+    MAX_DASHBOARDS = 100
+    MAX_MONITORING_CHATS = 50
+    
     def __init__(self, config, db_manager, strategy, risk_manager, 
                  market_data, position_tracker, chart_generator,
                  alert_system=None, error_handler=None, user_manager=None, signal_session_manager=None, task_scheduler=None):
@@ -204,6 +208,7 @@ class TradingBot:
         self.signal_lock = asyncio.Lock()
         self.monitoring_tasks: Dict[int, asyncio.Task] = {}
         self.active_dashboards: Dict[int, Dict] = {}
+        self._is_shutting_down: bool = False
         
         self.rate_limiter = RateLimiter(
             max_calls=30,
@@ -262,6 +267,17 @@ class TradingBot:
             ]
             for k in expired_keys:
                 self.sent_signals_cache.pop(k, None)
+            
+            if len(self.sent_signals_cache) >= self.MAX_CACHE_SIZE:
+                sorted_entries = sorted(
+                    self.sent_signals_cache.items(),
+                    key=lambda x: x[1]['timestamp']
+                )
+                entries_to_remove = len(self.sent_signals_cache) - self.MAX_CACHE_SIZE + 1
+                for i in range(min(entries_to_remove, len(sorted_entries))):
+                    key_to_remove = sorted_entries[i][0]
+                    self.sent_signals_cache.pop(key_to_remove, None)
+                logger.debug(f"Cache limit enforcement: removed {entries_to_remove} oldest entries")
             
             signal_hash = self._generate_signal_hash(user_id, signal_type, entry_price)
             
@@ -322,14 +338,15 @@ class TradingBot:
             logger.info("✅ Dashboard cleanup background task started")
     
     async def stop_background_cleanup_tasks(self):
-        """Stop background cleanup tasks"""
+        """Stop background cleanup tasks and all monitoring tasks"""
         self._cleanup_tasks_running = False
+        self._is_shutting_down = True
         
         if self._cache_cleanup_task and not self._cache_cleanup_task.done():
             self._cache_cleanup_task.cancel()
             try:
-                await self._cache_cleanup_task
-            except asyncio.CancelledError:
+                await asyncio.wait_for(self._cache_cleanup_task, timeout=5.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
                 pass
             self._cache_cleanup_task = None
             logger.info("Signal cache cleanup task stopped")
@@ -337,11 +354,79 @@ class TradingBot:
         if self._dashboard_cleanup_task and not self._dashboard_cleanup_task.done():
             self._dashboard_cleanup_task.cancel()
             try:
-                await self._dashboard_cleanup_task
-            except asyncio.CancelledError:
+                await asyncio.wait_for(self._dashboard_cleanup_task, timeout=5.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
                 pass
             self._dashboard_cleanup_task = None
             logger.info("Dashboard cleanup task stopped")
+        
+        await self._cancel_all_monitoring_tasks()
+        
+        await self._cancel_all_dashboard_tasks()
+        
+        logger.info("All background and monitoring tasks stopped")
+    
+    async def _cancel_all_monitoring_tasks(self, timeout: float = 10.0):
+        """Cancel all monitoring tasks with proper cleanup"""
+        if not self.monitoring_tasks:
+            logger.debug("No monitoring tasks to cancel")
+            return
+        
+        self.monitoring = False
+        task_count = len(self.monitoring_tasks)
+        logger.info(f"Cancelling {task_count} monitoring tasks...")
+        
+        tasks_to_cancel = []
+        for chat_id, task in list(self.monitoring_tasks.items()):
+            if task and not task.done():
+                task.cancel()
+                tasks_to_cancel.append(task)
+                logger.debug(f"Cancelled monitoring task for chat {mask_user_id(chat_id)}")
+        
+        if tasks_to_cancel:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*tasks_to_cancel, return_exceptions=True),
+                    timeout=timeout
+                )
+                logger.info(f"✅ All {len(tasks_to_cancel)} monitoring tasks cancelled successfully")
+            except asyncio.TimeoutError:
+                logger.warning(f"Some monitoring tasks did not complete within {timeout}s timeout")
+            except asyncio.CancelledError:
+                logger.debug("Monitoring task cancellation was itself cancelled")
+        
+        self.monitoring_tasks.clear()
+        self.monitoring_chats.clear()
+    
+    async def _cancel_all_dashboard_tasks(self, timeout: float = 5.0):
+        """Cancel all dashboard update tasks"""
+        if not self.active_dashboards:
+            logger.debug("No dashboard tasks to cancel")
+            return
+        
+        dashboard_count = len(self.active_dashboards)
+        logger.info(f"Cancelling {dashboard_count} dashboard tasks...")
+        
+        tasks_to_cancel = []
+        for user_id, dash_info in list(self.active_dashboards.items()):
+            task = dash_info.get('task')
+            if task and not task.done():
+                task.cancel()
+                tasks_to_cancel.append(task)
+        
+        if tasks_to_cancel:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*tasks_to_cancel, return_exceptions=True),
+                    timeout=timeout
+                )
+                logger.info(f"✅ All {len(tasks_to_cancel)} dashboard tasks cancelled successfully")
+            except asyncio.TimeoutError:
+                logger.warning(f"Some dashboard tasks did not complete within {timeout}s timeout")
+            except asyncio.CancelledError:
+                pass
+        
+        self.active_dashboards.clear()
     
     async def _signal_cache_cleanup_loop(self):
         """Background task untuk cleanup expired signal cache entries"""
@@ -443,13 +528,23 @@ class TradingBot:
         try:
             return {
                 'signal_cache_size': len(self.sent_signals_cache),
+                'signal_cache_max': self.MAX_CACHE_SIZE,
+                'signal_cache_usage_pct': (len(self.sent_signals_cache) / self.MAX_CACHE_SIZE * 100) if self.MAX_CACHE_SIZE > 0 else 0,
                 'active_dashboards': len(self.active_dashboards),
+                'dashboards_max': self.MAX_DASHBOARDS,
+                'dashboards_usage_pct': (len(self.active_dashboards) / self.MAX_DASHBOARDS * 100) if self.MAX_DASHBOARDS > 0 else 0,
                 'monitoring_chats': len(self.monitoring_chats),
+                'monitoring_chats_max': self.MAX_MONITORING_CHATS,
                 'monitoring_tasks': len(self.monitoring_tasks),
-                'cache_expiry_seconds': self.signal_cache_expiry_seconds
+                'cache_expiry_seconds': self.signal_cache_expiry_seconds,
+                'is_shutting_down': self._is_shutting_down,
+                'cleanup_tasks_running': self._cleanup_tasks_running
             }
+        except AttributeError as e:
+            logger.warning(f"Attribute error getting cache stats (bot may not be fully initialized): {e}")
+            return {'error': str(e), 'initialized': False}
         except Exception as e:
-            logger.error(f"Error getting cache stats: {e}")
+            logger.error(f"Unexpected error getting cache stats: {type(e).__name__}: {e}")
             return {'error': str(e)}
     
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -507,11 +602,29 @@ class TradingBot:
             await update.message.reply_text(welcome_msg, parse_mode='Markdown')
             logger.info(f"Start command executed successfully for user {mask_user_id(update.effective_user.id)}")
             
+        except asyncio.CancelledError:
+            logger.info(f"Start command cancelled for user {mask_user_id(update.effective_user.id)}")
+            raise
+        except RetryAfter as e:
+            logger.warning(f"Rate limit in start command: retry after {e.retry_after}s")
+            await asyncio.sleep(e.retry_after)
+        except (TimedOut, NetworkError) as e:
+            logger.warning(f"Network/timeout error in start command: {e}")
+            try:
+                await update.message.reply_text("⏳ Koneksi timeout, silakan coba lagi.")
+            except (TelegramError, asyncio.CancelledError):
+                pass
+        except TelegramError as e:
+            logger.error(f"Telegram error in start command: {e}")
+            try:
+                await update.message.reply_text("❌ Terjadi error Telegram. Silakan coba lagi.")
+            except (TelegramError, asyncio.CancelledError):
+                pass
         except Exception as e:
-            logger.error(f"Error in start command: {e}", exc_info=True)
+            logger.error(f"Unexpected error in start command: {type(e).__name__}: {e}", exc_info=True)
             try:
                 await update.message.reply_text("❌ Terjadi error saat memproses command. Silakan coba lagi.")
-            except Exception:
+            except (TelegramError, asyncio.CancelledError):
                 pass
     
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -541,11 +654,24 @@ class TradingBot:
             await update.message.reply_text(help_msg, parse_mode='Markdown')
             logger.info(f"Help command executed for user {mask_user_id(update.effective_user.id)}")
             
-        except Exception as e:
-            logger.error(f"Error in help command: {e}", exc_info=True)
+        except asyncio.CancelledError:
+            logger.info(f"Help command cancelled for user {mask_user_id(update.effective_user.id)}")
+            raise
+        except RetryAfter as e:
+            logger.warning(f"Rate limit in help command: retry after {e.retry_after}s")
+        except (TimedOut, NetworkError) as e:
+            logger.warning(f"Network/timeout error in help command: {e}")
+        except TelegramError as e:
+            logger.error(f"Telegram error in help command: {e}")
             try:
                 await update.message.reply_text("❌ Error menampilkan bantuan.")
-            except Exception:
+            except (TelegramError, asyncio.CancelledError):
+                pass
+        except Exception as e:
+            logger.error(f"Unexpected error in help command: {type(e).__name__}: {e}", exc_info=True)
+            try:
+                await update.message.reply_text("❌ Error menampilkan bantuan.")
+            except (TelegramError, asyncio.CancelledError):
                 pass
     
     async def monitor_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -559,6 +685,11 @@ class TradingBot:
                 await update.message.reply_text("⚠️ Monitoring sudah berjalan untuk Anda!")
                 return
             
+            if len(self.monitoring_chats) >= self.MAX_MONITORING_CHATS:
+                await update.message.reply_text("⚠️ Batas maksimum monitoring tercapai. Silakan coba lagi nanti.")
+                logger.warning(f"Monitoring limit reached ({self.MAX_MONITORING_CHATS})")
+                return
+            
             if not self.monitoring:
                 self.monitoring = True
             
@@ -569,11 +700,28 @@ class TradingBot:
                 self.monitoring_tasks[chat_id] = task
                 logger.info(f"✅ Monitoring task created for chat {mask_user_id(chat_id)}")
                 
-        except Exception as e:
-            logger.error(f"Error in monitor command: {e}", exc_info=True)
+        except asyncio.CancelledError:
+            logger.info(f"Monitor command cancelled for user {mask_user_id(update.effective_user.id)}")
+            raise
+        except RetryAfter as e:
+            logger.warning(f"Rate limit in monitor command: retry after {e.retry_after}s")
+        except (TimedOut, NetworkError) as e:
+            logger.warning(f"Network/timeout error in monitor command: {e}")
+            try:
+                await update.message.reply_text("⏳ Koneksi timeout, silakan coba lagi.")
+            except (TelegramError, asyncio.CancelledError):
+                pass
+        except TelegramError as e:
+            logger.error(f"Telegram error in monitor command: {e}")
             try:
                 await update.message.reply_text("❌ Error memulai monitoring. Silakan coba lagi.")
-            except Exception:
+            except (TelegramError, asyncio.CancelledError):
+                pass
+        except Exception as e:
+            logger.error(f"Unexpected error in monitor command: {type(e).__name__}: {e}", exc_info=True)
+            try:
+                await update.message.reply_text("❌ Error memulai monitoring. Silakan coba lagi.")
+            except (TelegramError, asyncio.CancelledError):
                 pass
     
     async def auto_start_monitoring(self, chat_ids: List[int]):
@@ -618,11 +766,28 @@ class TradingBot:
                 
             logger.info(f"Stop monitor command executed for user {mask_user_id(update.effective_user.id)}")
             
-        except Exception as e:
-            logger.error(f"Error in stopmonitor command: {e}", exc_info=True)
+        except asyncio.CancelledError:
+            logger.info(f"Stopmonitor command cancelled for user {mask_user_id(update.effective_user.id)}")
+            raise
+        except RetryAfter as e:
+            logger.warning(f"Rate limit in stopmonitor command: retry after {e.retry_after}s")
+        except (TimedOut, NetworkError) as e:
+            logger.warning(f"Network/timeout error in stopmonitor command: {e}")
+            try:
+                await update.message.reply_text("⏳ Koneksi timeout, silakan coba lagi.")
+            except (TelegramError, asyncio.CancelledError):
+                pass
+        except TelegramError as e:
+            logger.error(f"Telegram error in stopmonitor command: {e}")
             try:
                 await update.message.reply_text("❌ Error menghentikan monitoring. Silakan coba lagi.")
-            except Exception:
+            except (TelegramError, asyncio.CancelledError):
+                pass
+        except Exception as e:
+            logger.error(f"Unexpected error in stopmonitor command: {type(e).__name__}: {e}", exc_info=True)
+            try:
+                await update.message.reply_text("❌ Error menghentikan monitoring. Silakan coba lagi.")
+            except (TelegramError, asyncio.CancelledError):
                 pass
     
     async def _monitoring_loop(self, chat_id: int):
@@ -631,14 +796,14 @@ class TradingBot:
         
         last_signal_check = datetime.now() - timedelta(seconds=self.config.SIGNAL_COOLDOWN_SECONDS)
         last_tick_process_time = datetime.now() - timedelta(seconds=self.tick_throttle_seconds)
-        last_sent_signal = None  # Track last sent signal direction to prevent duplicates
-        last_sent_signal_price = None  # Track last sent signal price
+        last_sent_signal = None
+        last_sent_signal_price = None
         last_sent_signal_time = datetime.now() - timedelta(seconds=5)
         retry_delay = 1.0
         max_retry_delay = 30.0
         
         try:
-            while self.monitoring and chat_id in self.monitoring_chats:
+            while self.monitoring and chat_id in self.monitoring_chats and not self._is_shutting_down:
                 try:
                     tick = await asyncio.wait_for(tick_queue.get(), timeout=30.0)
                     
@@ -1070,6 +1235,31 @@ class TradingBot:
                 logger.debug(f"Dashboard already running for user {mask_user_id(user_id)}, stopping old one first")
                 await self.stop_dashboard(user_id)
             
+            async with self._dashboard_lock:
+                if len(self.active_dashboards) >= self.MAX_DASHBOARDS:
+                    now = datetime.now(pytz.UTC)
+                    stale_users = []
+                    
+                    for uid, dash_info in list(self.active_dashboards.items()):
+                        task = dash_info.get('task')
+                        if task is None or task.done():
+                            stale_users.append(uid)
+                    
+                    for uid in stale_users:
+                        self.active_dashboards.pop(uid, None)
+                    
+                    if len(self.active_dashboards) >= self.MAX_DASHBOARDS:
+                        sorted_dashboards = sorted(
+                            self.active_dashboards.items(),
+                            key=lambda x: x[1].get('started_at', now)
+                        )
+                        oldest_user_id = sorted_dashboards[0][0]
+                        oldest_task = sorted_dashboards[0][1].get('task')
+                        if oldest_task and not oldest_task.done():
+                            oldest_task.cancel()
+                        self.active_dashboards.pop(oldest_user_id, None)
+                        logger.warning(f"Dashboard limit reached, removed oldest dashboard for user {mask_user_id(oldest_user_id)}")
+            
             dashboard_task = asyncio.create_task(
                 self._dashboard_update_loop(user_id, chat_id, position_id, message_id)
             )
@@ -1079,13 +1269,19 @@ class TradingBot:
                 'chat_id': chat_id,
                 'position_id': position_id,
                 'message_id': message_id,
-                'started_at': datetime.now(pytz.UTC)
+                'started_at': datetime.now(pytz.UTC),
+                'created_at': datetime.now()
             }
             
             logger.info(f"📊 Dashboard started - User:{mask_user_id(user_id)} Position:{position_id} Message:{message_id}")
             
+        except asyncio.CancelledError:
+            logger.info(f"Dashboard start cancelled for user {mask_user_id(user_id)}")
+            raise
+        except (TelegramError, NetworkError, TimedOut) as e:
+            logger.error(f"Telegram error starting dashboard for user {mask_user_id(user_id)}: {e}")
         except Exception as e:
-            logger.error(f"Error starting dashboard for user {mask_user_id(user_id)}: {e}")
+            logger.error(f"Unexpected error starting dashboard for user {mask_user_id(user_id)}: {type(e).__name__}: {e}")
     
     async def stop_dashboard(self, user_id: int):
         """Stop dashboard monitoring dan cleanup task"""
@@ -1242,6 +1438,7 @@ class TradingBot:
             return
         
         user_id = update.effective_user.id
+        session = None
         
         try:
             session = self.db.get_session()
@@ -1270,18 +1467,37 @@ class TradingBot:
                 
                 msg += "\n"
             
-            session.close()
             await update.message.reply_text(msg, parse_mode='Markdown')
             
+        except asyncio.CancelledError:
+            logger.info(f"Riwayat command cancelled for user {mask_user_id(user_id)}")
+            raise
+        except RetryAfter as e:
+            logger.warning(f"Rate limit in riwayat command: retry after {e.retry_after}s")
+        except (TimedOut, NetworkError) as e:
+            logger.warning(f"Network/timeout error in riwayat command: {e}")
+        except TelegramError as e:
+            logger.error(f"Telegram error in riwayat command: {e}")
+            try:
+                await update.message.reply_text("❌ Error mengambil riwayat.")
+            except (TelegramError, asyncio.CancelledError):
+                pass
         except Exception as e:
-            logger.error(f"Error fetching history: {e}")
-            await update.message.reply_text("❌ Error mengambil riwayat.")
+            logger.error(f"Unexpected error fetching history: {type(e).__name__}: {e}")
+            try:
+                await update.message.reply_text("❌ Error mengambil riwayat.")
+            except (TelegramError, asyncio.CancelledError):
+                pass
+        finally:
+            if session:
+                session.close()
     
     async def performa_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self.is_authorized(update.effective_user.id):
             return
         
         user_id = update.effective_user.id
+        session = None
         
         try:
             session = self.db.get_session()
@@ -1323,12 +1539,30 @@ class TradingBot:
                 f"P/L: ${today_pl:.2f}\n"
             )
             
-            session.close()
             await update.message.reply_text(msg, parse_mode='Markdown')
             
+        except asyncio.CancelledError:
+            logger.info(f"Performa command cancelled for user {mask_user_id(user_id)}")
+            raise
+        except RetryAfter as e:
+            logger.warning(f"Rate limit in performa command: retry after {e.retry_after}s")
+        except (TimedOut, NetworkError) as e:
+            logger.warning(f"Network/timeout error in performa command: {e}")
+        except TelegramError as e:
+            logger.error(f"Telegram error in performa command: {e}")
+            try:
+                await update.message.reply_text("❌ Error menghitung performa.")
+            except (TelegramError, asyncio.CancelledError):
+                pass
         except Exception as e:
-            logger.error(f"Error calculating performance: {e}")
-            await update.message.reply_text("❌ Error menghitung performa.")
+            logger.error(f"Unexpected error calculating performance: {type(e).__name__}: {e}")
+            try:
+                await update.message.reply_text("❌ Error menghitung performa.")
+            except (TelegramError, asyncio.CancelledError):
+                pass
+        finally:
+            if session:
+                session.close()
     
     async def analytics_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self.is_authorized(update.effective_user.id):
@@ -2159,47 +2393,24 @@ class TradingBot:
         logger.info("STOPPING TELEGRAM BOT")
         logger.info("=" * 50)
         
+        self._is_shutting_down = True
+        
         import os
         if os.path.exists(self.instance_lock_file):
             try:
                 os.remove(self.instance_lock_file)
                 logger.info("✅ Bot instance lock removed")
+            except OSError as e:
+                logger.warning(f"Could not remove instance lock (OS error): {e}")
             except Exception as e:
-                logger.warning(f"Could not remove instance lock: {e}")
+                logger.warning(f"Could not remove instance lock: {type(e).__name__}: {e}")
         
         if not self.app:
             logger.warning("Bot app not initialized, nothing to stop")
             return
         
-        self.monitoring = False
-        
-        logger.info(f"Stopping {len(self.active_dashboards)} active dashboards...")
-        dashboard_users = list(self.active_dashboards.keys())
-        for user_id in dashboard_users:
-            await self.stop_dashboard(user_id)
-        logger.info("All dashboards stopped")
-        
-        logger.info(f"Cancelling {len(self.monitoring_tasks)} monitoring tasks...")
-        for chat_id, task in list(self.monitoring_tasks.items()):
-            if not task.done():
-                task.cancel()
-                logger.debug(f"Cancelled monitoring task for chat {mask_user_id(chat_id)}")
-        
-        if self.monitoring_tasks:
-            try:
-                await asyncio.wait_for(
-                    asyncio.gather(*self.monitoring_tasks.values(), return_exceptions=True),
-                    timeout=10
-                )
-                logger.info("✅ All monitoring tasks cancelled successfully")
-            except asyncio.TimeoutError:
-                logger.warning("Some monitoring tasks did not complete within 10s timeout")
-            except Exception as e:
-                logger.error(f"Error during task cleanup: {e}")
-        
-        self.monitoring_tasks.clear()
-        self.monitoring_chats.clear()
-        logger.info("✅ Task cleanup completed")
+        await self.stop_background_cleanup_tasks()
+        logger.info("✅ All background tasks and monitoring stopped")
         
         if self.config.TELEGRAM_WEBHOOK_MODE:
             logger.info("Deleting Telegram webhook...")

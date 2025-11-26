@@ -1,10 +1,12 @@
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
+from contextlib import contextmanager
+import threading
 import pytz
 from bot.logger import setup_logger
 from sqlalchemy import Column, Integer, String, DateTime, Boolean, Float, create_engine
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import sessionmaker, scoped_session
 
 logger = setup_logger('UserManager')
 
@@ -45,95 +47,113 @@ class UserManager:
         self.config = config
         self.db_path = db_path
         
+        self._lock = threading.Lock()
+        self._user_locks = {}
+        self._user_locks_lock = threading.Lock()
+        
         engine = create_engine(f'sqlite:///{self.db_path}')
         Base.metadata.create_all(engine)
         
-        Session = sessionmaker(bind=engine)
-        self.session_factory = Session
+        session_factory = sessionmaker(bind=engine)
+        self.Session = scoped_session(session_factory)
         
         self.active_users = {}
-        logger.info("User manager initialized")
+        logger.info("User manager initialized with thread-safe session")
     
+    def _get_user_lock(self, telegram_id: int) -> threading.Lock:
+        """Get or create a lock for a specific user to ensure atomic operations"""
+        with self._user_locks_lock:
+            if telegram_id not in self._user_locks:
+                self._user_locks[telegram_id] = threading.Lock()
+            return self._user_locks[telegram_id]
+    
+    @contextmanager
     def get_session(self):
-        return self.session_factory()
+        """Context manager for thread-safe session handling with proper cleanup"""
+        session = self.Session()
+        try:
+            yield session
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+            self.Session.remove()
     
     def create_user(self, telegram_id: int, username: Optional[str] = None,
                    first_name: Optional[str] = None, last_name: Optional[str] = None) -> User:
-        session = self.get_session()
-        
-        try:
-            existing = session.query(User).filter(User.telegram_id == telegram_id).first()
-            
-            if existing:
-                logger.info(f"User already exists: {telegram_id}")
-                return existing
-            
-            is_admin = telegram_id in self.config.AUTHORIZED_USER_IDS
-            
-            user = User(
-                telegram_id=telegram_id,
-                username=username,
-                first_name=first_name,
-                last_name=last_name,
-                is_active=True,
-                is_admin=is_admin
-            )
-            
-            session.add(user)
-            session.commit()
-            
-            preferences = UserPreferences(telegram_id=telegram_id)
-            session.add(preferences)
-            session.commit()
-            
-            logger.info(f"Created new user: {telegram_id} ({username})")
-            
-            return user
-            
-        except Exception as e:
-            logger.error(f"Error creating user: {e}")
-            session.rollback()
-            return None
-        finally:
-            session.close()
+        user_lock = self._get_user_lock(telegram_id)
+        with user_lock:
+            with self.get_session() as session:
+                try:
+                    existing = session.query(User).filter(User.telegram_id == telegram_id).first()
+                    
+                    if existing:
+                        logger.info(f"User already exists: {telegram_id}")
+                        session.expunge(existing)
+                        return existing
+                    
+                    is_admin = telegram_id in self.config.AUTHORIZED_USER_IDS
+                    
+                    user = User(
+                        telegram_id=telegram_id,
+                        username=username,
+                        first_name=first_name,
+                        last_name=last_name,
+                        is_active=True,
+                        is_admin=is_admin
+                    )
+                    
+                    session.add(user)
+                    session.flush()
+                    
+                    preferences = UserPreferences(telegram_id=telegram_id)
+                    session.add(preferences)
+                    
+                    logger.info(f"Created new user: {telegram_id} ({username})")
+                    session.expunge(user)
+                    return user
+                    
+                except Exception as e:
+                    logger.error(f"Error creating user: {e}")
+                    return None
     
     def get_user(self, telegram_id: int) -> Optional[User]:
-        session = self.get_session()
-        
-        try:
-            user = session.query(User).filter(User.telegram_id == telegram_id).first()
-            
-            if user:
-                session.expunge(user)
-            
-            return user
-        finally:
-            session.close()
+        with self.get_session() as session:
+            try:
+                user = session.query(User).filter(User.telegram_id == telegram_id).first()
+                
+                if user:
+                    session.expunge(user)
+                
+                return user
+            except Exception as e:
+                logger.error(f"Error getting user: {e}")
+                return None
     
     def get_user_by_username(self, username: str) -> Optional[int]:
-        session = self.get_session()
-        
-        try:
-            user = session.query(User).filter(User.username == username).first()
-            return user.telegram_id if user else None
-        finally:
-            session.close()
+        with self.get_session() as session:
+            try:
+                user = session.query(User).filter(User.username == username).first()
+                return user.telegram_id if user else None
+            except Exception as e:
+                logger.error(f"Error getting user by username: {e}")
+                return None
     
     def update_user_activity(self, telegram_id: int):
-        session = self.get_session()
-        
-        try:
-            user = session.query(User).filter(User.telegram_id == telegram_id).first()
-            
-            if user:
-                user.last_active = datetime.utcnow()
-                session.commit()
-                logger.debug(f"Updated activity for user {telegram_id}")
-        except Exception as e:
-            logger.error(f"Error updating user activity: {e}")
-            session.rollback()
-        finally:
-            session.close()
+        """Thread-safe update of user activity timestamp with per-user locking"""
+        user_lock = self._get_user_lock(telegram_id)
+        with user_lock:
+            with self.get_session() as session:
+                try:
+                    user = session.query(User).filter(User.telegram_id == telegram_id).first()
+                    
+                    if user:
+                        user.last_active = datetime.utcnow()
+                        logger.debug(f"Updated activity for user {telegram_id}")
+                except Exception as e:
+                    logger.error(f"Error updating user activity: {e}")
     
     def is_authorized(self, telegram_id: int) -> bool:
         if telegram_id in self.config.AUTHORIZED_USER_IDS:
@@ -149,117 +169,113 @@ class UserManager:
         return user.is_admin if user else False
     
     def get_all_users(self) -> List[User]:
-        session = self.get_session()
-        
-        try:
-            users = session.query(User).all()
-            return users
-        finally:
-            session.close()
+        with self.get_session() as session:
+            try:
+                users = session.query(User).all()
+                for user in users:
+                    session.expunge(user)
+                return users
+            except Exception as e:
+                logger.error(f"Error getting all users: {e}")
+                return []
     
     def get_active_users(self) -> List[User]:
-        session = self.get_session()
-        
-        try:
-            users = session.query(User).filter(User.is_active == True).all()
-            return users
-        finally:
-            session.close()
+        with self.get_session() as session:
+            try:
+                users = session.query(User).filter(User.is_active == True).all()
+                for user in users:
+                    session.expunge(user)
+                return users
+            except Exception as e:
+                logger.error(f"Error getting active users: {e}")
+                return []
     
     def deactivate_user(self, telegram_id: int) -> bool:
-        session = self.get_session()
-        
-        try:
-            user = session.query(User).filter(User.telegram_id == telegram_id).first()
-            
-            if user:
-                user.is_active = False
-                session.commit()
-                logger.info(f"Deactivated user: {telegram_id}")
-                return True
-            
-            return False
-        except Exception as e:
-            logger.error(f"Error deactivating user: {e}")
-            session.rollback()
-            return False
-        finally:
-            session.close()
+        user_lock = self._get_user_lock(telegram_id)
+        with user_lock:
+            with self.get_session() as session:
+                try:
+                    user = session.query(User).filter(User.telegram_id == telegram_id).first()
+                    
+                    if user:
+                        user.is_active = False
+                        logger.info(f"Deactivated user: {telegram_id}")
+                        return True
+                    
+                    return False
+                except Exception as e:
+                    logger.error(f"Error deactivating user: {e}")
+                    return False
     
     def activate_user(self, telegram_id: int) -> bool:
-        session = self.get_session()
-        
-        try:
-            user = session.query(User).filter(User.telegram_id == telegram_id).first()
-            
-            if user:
-                user.is_active = True
-                session.commit()
-                logger.info(f"Activated user: {telegram_id}")
-                return True
-            
-            return False
-        except Exception as e:
-            logger.error(f"Error activating user: {e}")
-            session.rollback()
-            return False
-        finally:
-            session.close()
+        user_lock = self._get_user_lock(telegram_id)
+        with user_lock:
+            with self.get_session() as session:
+                try:
+                    user = session.query(User).filter(User.telegram_id == telegram_id).first()
+                    
+                    if user:
+                        user.is_active = True
+                        logger.info(f"Activated user: {telegram_id}")
+                        return True
+                    
+                    return False
+                except Exception as e:
+                    logger.error(f"Error activating user: {e}")
+                    return False
     
     def update_user_stats(self, telegram_id: int, profit: float):
-        session = self.get_session()
-        
-        try:
-            user = session.query(User).filter(User.telegram_id == telegram_id).first()
-            
-            if user:
-                user.total_trades += 1
-                user.total_profit += profit
-                session.commit()
-                logger.debug(f"Updated stats for user {telegram_id}: profit={profit}")
-        except Exception as e:
-            logger.error(f"Error updating user stats: {e}")
-            session.rollback()
-        finally:
-            session.close()
+        """Thread-safe atomic update of user statistics with per-user locking"""
+        user_lock = self._get_user_lock(telegram_id)
+        with user_lock:
+            with self.get_session() as session:
+                try:
+                    user = session.query(User).filter(User.telegram_id == telegram_id).first()
+                    
+                    if user:
+                        user.total_trades += 1
+                        user.total_profit += profit
+                        logger.debug(f"Updated stats for user {telegram_id}: profit={profit}")
+                except Exception as e:
+                    logger.error(f"Error updating user stats: {e}")
     
     def get_user_preferences(self, telegram_id: int) -> Optional[UserPreferences]:
-        session = self.get_session()
-        
-        try:
-            prefs = session.query(UserPreferences).filter(
-                UserPreferences.telegram_id == telegram_id
-            ).first()
-            return prefs
-        finally:
-            session.close()
+        with self.get_session() as session:
+            try:
+                prefs = session.query(UserPreferences).filter(
+                    UserPreferences.telegram_id == telegram_id
+                ).first()
+                if prefs:
+                    session.expunge(prefs)
+                return prefs
+            except Exception as e:
+                logger.error(f"Error getting user preferences: {e}")
+                return None
     
     def update_user_preferences(self, telegram_id: int, **kwargs) -> bool:
-        session = self.get_session()
-        
-        try:
-            prefs = session.query(UserPreferences).filter(
-                UserPreferences.telegram_id == telegram_id
-            ).first()
-            
-            if not prefs:
-                prefs = UserPreferences(telegram_id=telegram_id)
-                session.add(prefs)
-            
-            for key, value in kwargs.items():
-                if hasattr(prefs, key):
-                    setattr(prefs, key, value)
-            
-            session.commit()
-            logger.info(f"Updated preferences for user {telegram_id}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error updating preferences: {e}")
-            session.rollback()
-            return False
-        finally:
-            session.close()
+        """Thread-safe atomic update of user preferences with per-user locking"""
+        user_lock = self._get_user_lock(telegram_id)
+        with user_lock:
+            with self.get_session() as session:
+                try:
+                    prefs = session.query(UserPreferences).filter(
+                        UserPreferences.telegram_id == telegram_id
+                    ).first()
+                    
+                    if not prefs:
+                        prefs = UserPreferences(telegram_id=telegram_id)
+                        session.add(prefs)
+                    
+                    for key, value in kwargs.items():
+                        if hasattr(prefs, key):
+                            setattr(prefs, key, value)
+                    
+                    logger.info(f"Updated preferences for user {telegram_id}")
+                    return True
+                    
+                except Exception as e:
+                    logger.error(f"Error updating preferences: {e}")
+                    return False
     
     def get_user_info(self, telegram_id: int) -> Optional[Dict]:
         user = self.get_user(telegram_id)
@@ -316,21 +332,26 @@ class UserManager:
         return profile
     
     def get_user_count(self) -> Dict:
-        session = self.get_session()
-        
-        try:
-            total = session.query(User).count()
-            active = session.query(User).filter(User.is_active == True).count()
-            admins = session.query(User).filter(User.is_admin == True).count()
-            
-            return {
-                'total': total,
-                'active': active,
-                'inactive': total - active,
-                'admins': admins
-            }
-        finally:
-            session.close()
+        with self.get_session() as session:
+            try:
+                total = session.query(User).count()
+                active = session.query(User).filter(User.is_active == True).count()
+                admins = session.query(User).filter(User.is_admin == True).count()
+                
+                return {
+                    'total': total,
+                    'active': active,
+                    'inactive': total - active,
+                    'admins': admins
+                }
+            except Exception as e:
+                logger.error(f"Error getting user count: {e}")
+                return {
+                    'total': 0,
+                    'active': 0,
+                    'inactive': 0,
+                    'admins': 0
+                }
     
     def has_access(self, telegram_id: int) -> bool:
         if telegram_id in self.config.AUTHORIZED_USER_IDS:

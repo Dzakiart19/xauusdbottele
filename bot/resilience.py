@@ -12,6 +12,14 @@ import logging
 logger = logging.getLogger('Resilience')
 
 
+class CircuitBreakerOpenException(Exception):
+    """Exception raised when circuit breaker is open"""
+    def __init__(self, name: str, retry_in: float):
+        self.name = name
+        self.retry_in = retry_in
+        super().__init__(f"CircuitBreaker '{name}' is OPEN. Retry in {retry_in:.1f}s")
+
+
 class CircuitState(Enum):
     """Circuit breaker states"""
     CLOSED = "CLOSED"
@@ -75,17 +83,17 @@ class CircuitBreaker:
                 self.state = CircuitState.HALF_OPEN
             else:
                 remaining = self.recovery_timeout - (time.time() - (self.last_failure_time or 0))
-                raise Exception(
-                    f"CircuitBreaker '{self.name}' is OPEN. "
-                    f"Retry in {remaining:.1f}s"
-                )
+                raise CircuitBreakerOpenException(self.name, remaining)
         
         try:
             result = func(*args, **kwargs)
             self._on_success()
             return result
-        except self.expected_exception as e:
-            self._on_failure()
+        except CircuitBreakerOpenException:
+            raise
+        except Exception as e:
+            if isinstance(e, self.expected_exception):
+                self._on_failure()
             raise
     
     async def call_async(self, func: Callable, *args, **kwargs) -> Any:
@@ -108,17 +116,17 @@ class CircuitBreaker:
                 self.state = CircuitState.HALF_OPEN
             else:
                 remaining = self.recovery_timeout - (time.time() - (self.last_failure_time or 0))
-                raise Exception(
-                    f"CircuitBreaker '{self.name}' is OPEN. "
-                    f"Retry in {remaining:.1f}s"
-                )
+                raise CircuitBreakerOpenException(self.name, remaining)
         
         try:
             result = await func(*args, **kwargs)
             self._on_success()
             return result
-        except self.expected_exception as e:
-            self._on_failure()
+        except CircuitBreakerOpenException:
+            raise
+        except Exception as e:
+            if isinstance(e, self.expected_exception):
+                self._on_failure()
             raise
     
     def _should_attempt_reset(self) -> bool:

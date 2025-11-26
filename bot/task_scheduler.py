@@ -1,11 +1,15 @@
 import asyncio
 import gc
 from datetime import datetime, time, timedelta
-from typing import Callable, Optional, Dict, List
+from typing import Callable, Optional, Dict, List, Set
 import pytz
 from bot.logger import setup_logger
 
 logger = setup_logger('TaskScheduler')
+
+TASK_EXECUTION_TIMEOUT = 60
+TASK_CANCEL_TIMEOUT = 5
+SCHEDULER_STOP_TIMEOUT = 10
 
 class ScheduledTask:
     def __init__(self, name: str, func: Callable, interval: Optional[int] = None,
@@ -22,6 +26,7 @@ class ScheduledTask:
         self.error_count = 0
         self.consecutive_failures = 0
         self.current_execution_task = None
+        self._is_executing = False
         
         self._calculate_next_run()
     
@@ -54,16 +59,38 @@ class ScheduledTask:
         if self.next_run is None:
             return False
         
+        if self._is_executing:
+            return False
+        
         now = datetime.now(self.timezone)
         return now >= self.next_run
     
-    async def execute(self, alert_system=None):
+    async def execute(self, alert_system=None, shutdown_flag: Optional[asyncio.Event] = None):
+        if self._is_executing:
+            logger.warning(f"Task {self.name} is already executing, skipping")
+            return
+        
+        self._is_executing = True
         try:
             logger.info(f"Executing scheduled task: {self.name}")
             
+            if shutdown_flag and shutdown_flag.is_set():
+                logger.info(f"Shutdown requested, skipping task: {self.name}")
+                return
+            
             if asyncio.iscoroutinefunction(self.func):
                 self.current_execution_task = asyncio.create_task(self.func())
-                await self.current_execution_task
+                try:
+                    await asyncio.wait_for(self.current_execution_task, timeout=TASK_EXECUTION_TIMEOUT)
+                except asyncio.TimeoutError:
+                    logger.warning(f"Task {self.name} timed out after {TASK_EXECUTION_TIMEOUT}s")
+                    if self.current_execution_task and not self.current_execution_task.done():
+                        self.current_execution_task.cancel()
+                        try:
+                            await asyncio.wait_for(self.current_execution_task, timeout=TASK_CANCEL_TIMEOUT)
+                        except (asyncio.CancelledError, asyncio.TimeoutError):
+                            pass
+                    raise
             else:
                 self.func()
             
@@ -77,25 +104,52 @@ class ScheduledTask:
         except asyncio.CancelledError:
             logger.info(f"Task cancelled: {self.name}")
             raise
+        except asyncio.TimeoutError:
+            self.error_count += 1
+            self.consecutive_failures += 1
+            self._calculate_next_run()
+            logger.error(f"Task {self.name} timed out (Consecutive failures: {self.consecutive_failures})")
         except Exception as e:
             self.error_count += 1
             self.consecutive_failures += 1
+            self._calculate_next_run()
             logger.error(f"Error executing task {self.name}: {e} (Consecutive failures: {self.consecutive_failures})")
             
             if self.consecutive_failures > 3 and alert_system:
                 try:
-                    asyncio.create_task(
+                    alert_task = asyncio.create_task(
                         alert_system.send_system_error(
                             f"Task '{self.name}' failed {self.consecutive_failures}x consecutively\n"
                             f"Last error: {str(e)}\n"
                             f"Total errors: {self.error_count}/{self.run_count} runs"
                         )
                     )
+                    try:
+                        await asyncio.wait_for(alert_task, timeout=10)
+                    except asyncio.TimeoutError:
+                        logger.warning(f"Alert task for {self.name} timed out")
                     logger.warning(f"Alert sent: Task {self.name} has {self.consecutive_failures} consecutive failures")
                 except Exception as alert_error:
                     logger.error(f"Failed to send task failure alert: {alert_error}")
         finally:
             self.current_execution_task = None
+            self._is_executing = False
+    
+    async def cancel_execution(self, timeout: float = TASK_CANCEL_TIMEOUT) -> bool:
+        if self.current_execution_task and not self.current_execution_task.done():
+            logger.info(f"Cancelling task execution: {self.name}")
+            self.current_execution_task.cancel()
+            try:
+                await asyncio.wait_for(self.current_execution_task, timeout=timeout)
+                logger.info(f"Task {self.name} cancelled successfully")
+                return True
+            except asyncio.TimeoutError:
+                logger.warning(f"Task {self.name} cancellation timed out after {timeout}s")
+                return False
+            except asyncio.CancelledError:
+                logger.info(f"Task {self.name} cancelled")
+                return True
+        return True
     
     def enable(self):
         self.enabled = True
@@ -115,7 +169,8 @@ class ScheduledTask:
             'last_run': self.last_run.isoformat() if self.last_run else None,
             'next_run': self.next_run.isoformat() if self.next_run else None,
             'run_count': self.run_count,
-            'error_count': self.error_count
+            'error_count': self.error_count,
+            'is_executing': self._is_executing
         }
 
 class TaskScheduler:
@@ -125,7 +180,10 @@ class TaskScheduler:
         self.tasks: Dict[str, ScheduledTask] = {}
         self.running = False
         self.scheduler_task = None
-        self.active_task_executions = []
+        self._shutdown_flag = asyncio.Event()
+        self._active_task_executions: Set[asyncio.Task] = set()
+        self._all_created_tasks: Set[asyncio.Task] = set()
+        self._lock = asyncio.Lock()
         logger.info("Task scheduler initialized with alert system")
     
     def add_task(self, name: str, func: Callable, interval: Optional[int] = None,
@@ -175,31 +233,68 @@ class TaskScheduler:
     def get_all_tasks(self) -> List[ScheduledTask]:
         return list(self.tasks.values())
     
+    async def _track_task(self, task: asyncio.Task, task_name: str):
+        async with self._lock:
+            self._active_task_executions.add(task)
+            self._all_created_tasks.add(task)
+        
+        try:
+            await task
+        except asyncio.CancelledError:
+            logger.debug(f"Tracked task {task_name} was cancelled")
+        except Exception as e:
+            logger.error(f"Tracked task {task_name} failed: {e}")
+        finally:
+            async with self._lock:
+                self._active_task_executions.discard(task)
+                self._all_created_tasks.discard(task)
+    
     async def _scheduler_loop(self):
         logger.info("Scheduler loop started")
         
         try:
-            while self.running:
+            while self.running and not self._shutdown_flag.is_set():
                 try:
-                    for task in self.tasks.values():
-                        if task.should_run():
-                            execution_task = asyncio.create_task(task.execute(alert_system=self.alert_system))
-                            self.active_task_executions.append(execution_task)
-                            
-                            def remove_task(t):
-                                if t in self.active_task_executions:
-                                    self.active_task_executions.remove(t)
-                            
-                            execution_task.add_done_callback(remove_task)
+                    if self._shutdown_flag.is_set():
+                        logger.info("Shutdown flag detected in scheduler loop")
+                        break
                     
-                    await asyncio.sleep(1)
+                    for task in list(self.tasks.values()):
+                        if self._shutdown_flag.is_set():
+                            logger.info("Shutdown flag detected, stopping task scheduling")
+                            break
+                        
+                        if task.should_run():
+                            execution_task = asyncio.create_task(
+                                task.execute(
+                                    alert_system=self.alert_system,
+                                    shutdown_flag=self._shutdown_flag
+                                )
+                            )
+                            execution_task.set_name(f"task_exec_{task.name}")
+                            
+                            asyncio.create_task(self._track_task(execution_task, task.name))
+                    
+                    try:
+                        await asyncio.wait_for(
+                            self._shutdown_flag.wait(),
+                            timeout=1.0
+                        )
+                        if self._shutdown_flag.is_set():
+                            logger.info("Shutdown flag set, exiting scheduler loop")
+                            break
+                    except asyncio.TimeoutError:
+                        pass
                     
                 except asyncio.CancelledError:
                     logger.info("Scheduler loop cancelled")
                     break
                 except Exception as e:
                     logger.error(f"Error in scheduler loop: {e}")
-                    await asyncio.sleep(5)
+                    if not self._shutdown_flag.is_set():
+                        await asyncio.sleep(5)
+        except asyncio.CancelledError:
+            logger.info("Scheduler loop received cancellation at top level")
         finally:
             logger.info("Scheduler loop exiting")
     
@@ -208,67 +303,111 @@ class TaskScheduler:
             logger.warning("Scheduler already running")
             return
         
+        self._shutdown_flag.clear()
         self.running = True
         self.scheduler_task = asyncio.create_task(self._scheduler_loop())
+        self.scheduler_task.set_name("scheduler_loop")
         logger.info("Task scheduler started")
     
     async def stop(self):
         logger.info("=" * 50)
         logger.info("STOPPING TASK SCHEDULER")
+        logger.info(f"Active task executions: {len(self._active_task_executions)}")
+        logger.info(f"Total tracked tasks: {len(self._all_created_tasks)}")
         logger.info("=" * 50)
         
         if not self.running:
             logger.warning("Scheduler not running")
             return
         
+        self._shutdown_flag.set()
         self.running = False
+        
+        logger.info("Shutdown flag set, waiting for scheduler loop to stop...")
         
         if self.scheduler_task and not self.scheduler_task.done():
             logger.info("Cancelling scheduler loop task...")
             self.scheduler_task.cancel()
             try:
-                await asyncio.wait_for(self.scheduler_task, timeout=3)
-                logger.info("✅ Scheduler loop stopped")
+                await asyncio.wait_for(self.scheduler_task, timeout=TASK_CANCEL_TIMEOUT)
+                logger.info("✅ Scheduler loop stopped gracefully")
             except asyncio.TimeoutError:
-                logger.warning("Scheduler loop cancellation timed out")
+                logger.warning(f"Scheduler loop cancellation timed out after {TASK_CANCEL_TIMEOUT}s")
             except asyncio.CancelledError:
                 logger.info("✅ Scheduler loop cancelled")
             except Exception as e:
                 logger.error(f"Error stopping scheduler loop: {e}")
         
-        active_count = len(self.active_task_executions)
+        logger.info("Cancelling individual task executions...")
+        cancelled_count = 0
+        for task_name, task in self.tasks.items():
+            if task._is_executing:
+                logger.info(f"Cancelling running task: {task_name}")
+                success = await task.cancel_execution(timeout=TASK_CANCEL_TIMEOUT)
+                if success:
+                    cancelled_count += 1
+                else:
+                    logger.warning(f"Failed to cancel task: {task_name}")
+        logger.info(f"Cancelled {cancelled_count} individual task executions")
+        
+        async with self._lock:
+            active_tasks = list(self._active_task_executions)
+        
+        active_count = len(active_tasks)
         if active_count > 0:
-            logger.info(f"Cancelling {active_count} active task executions...")
-            for task_exec in self.active_task_executions:
+            logger.info(f"Cancelling {active_count} remaining active task executions...")
+            
+            for task_exec in active_tasks:
                 if not task_exec.done():
                     task_exec.cancel()
             
-            try:
-                await asyncio.wait_for(
-                    asyncio.gather(*self.active_task_executions, return_exceptions=True),
-                    timeout=5
-                )
-                logger.info("✅ All task executions cancelled")
-            except asyncio.TimeoutError:
-                logger.warning("Some task executions did not complete within timeout")
+            if active_tasks:
+                try:
+                    done, pending = await asyncio.wait(
+                        active_tasks,
+                        timeout=SCHEDULER_STOP_TIMEOUT,
+                        return_when=asyncio.ALL_COMPLETED
+                    )
+                    
+                    completed = len(done)
+                    still_pending = len(pending)
+                    
+                    if still_pending > 0:
+                        logger.warning(f"{still_pending} task executions did not complete within timeout")
+                        for p in pending:
+                            p.cancel()
+                    else:
+                        logger.info(f"✅ All {completed} task executions completed")
+                except Exception as e:
+                    logger.error(f"Error waiting for task executions: {e}")
+        else:
+            logger.info("No active task executions to cancel")
         
-        for task_name, task in self.tasks.items():
-            if task.current_execution_task and not task.current_execution_task.done():
-                logger.info(f"Cancelling running task: {task_name}")
-                task.current_execution_task.cancel()
-        
-        self.active_task_executions.clear()
+        async with self._lock:
+            remaining = len(self._all_created_tasks)
+            if remaining > 0:
+                logger.info(f"Cleaning up {remaining} remaining tracked tasks...")
+                for task in list(self._all_created_tasks):
+                    if not task.done():
+                        task.cancel()
+                self._all_created_tasks.clear()
+            
+            self._active_task_executions.clear()
         
         logger.info("=" * 50)
-        logger.info("TASK SCHEDULER STOPPED")
+        logger.info("TASK SCHEDULER STOPPED SUCCESSFULLY")
+        logger.info(f"Final state - Running: {self.running}, Shutdown flag: {self._shutdown_flag.is_set()}")
         logger.info("=" * 50)
     
     def get_status(self) -> Dict:
         return {
             'running': self.running,
+            'shutting_down': self._shutdown_flag.is_set(),
             'total_tasks': len(self.tasks),
             'enabled_tasks': len([t for t in self.tasks.values() if t.enabled]),
-            'active_executions': len(self.active_task_executions),
+            'executing_tasks': len([t for t in self.tasks.values() if t._is_executing]),
+            'active_executions': len(self._active_task_executions),
+            'total_tracked_tasks': len(self._all_created_tasks),
             'tasks': {name: task.to_dict() for name, task in self.tasks.items()}
         }
     
@@ -280,8 +419,9 @@ class TaskScheduler:
         
         for task in self.tasks.values():
             status_icon = '✅' if task.enabled else '⛔'
+            exec_icon = '🔄' if task._is_executing else ''
             
-            msg += f"{status_icon} *{task.name}*\n"
+            msg += f"{status_icon}{exec_icon} *{task.name}*\n"
             
             if task.interval:
                 msg += f"Interval: {task.interval}s\n"
@@ -346,7 +486,6 @@ def setup_default_tasks(scheduler: TaskScheduler, bot_components: Dict):
     async def monitor_positions():
         position_tracker = bot_components.get('position_tracker')
         if position_tracker:
-            # Early exit jika tidak ada active positions untuk hemat CPU
             total_active = sum(len(positions) for positions in position_tracker.active_positions.values())
             if total_active == 0:
                 logger.debug("Position monitoring: Skip - tidak ada active positions")
@@ -363,7 +502,6 @@ def setup_default_tasks(scheduler: TaskScheduler, bot_components: Dict):
         logger.debug("Periodic garbage collection completed")
     
     async def save_candles_periodic():
-        """Save candles to database periodically and prune old ones"""
         market_data = bot_components.get('market_data')
         db_manager = bot_components.get('db_manager')
         if market_data and db_manager:
@@ -376,17 +514,16 @@ def setup_default_tasks(scheduler: TaskScheduler, bot_components: Dict):
     scheduler.add_interval_task(
         'cleanup_charts',
         cleanup_old_charts,
-        interval_seconds=1800  # 30 menit untuk Koyeb free tier optimization
+        interval_seconds=1800
     )
     
     async def aggressive_chart_cleanup():
-        """Aggressive cleanup untuk Koyeb free tier - batasi jumlah file chart"""
         chart_generator = bot_components.get('chart_generator')
         if chart_generator:
             import os
             chart_dir = chart_generator.chart_dir
-            max_charts = 10  # Maximum charts untuk Koyeb free tier (optimized)
-            max_age_minutes = 30  # Hapus chart lebih dari 30 menit
+            max_charts = 10
+            max_age_minutes = 30
             
             try:
                 if os.path.exists(chart_dir):
@@ -420,7 +557,7 @@ def setup_default_tasks(scheduler: TaskScheduler, bot_components: Dict):
     scheduler.add_interval_task(
         'aggressive_chart_cleanup',
         aggressive_chart_cleanup,
-        interval_seconds=300  # 5 menit untuk Koyeb free tier
+        interval_seconds=300
     )
     
     scheduler.add_daily_task(

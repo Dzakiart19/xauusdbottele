@@ -155,9 +155,11 @@ class DatabaseManager:
             db_path: Path to SQLite database (used if database_url is not provided)
             database_url: PostgreSQL connection URL (e.g., postgresql://user:pass@host:port/dbname)
         """
+        self.is_postgres = False
+        self.engine = None
+        self.Session = None
+        
         try:
-            self.is_postgres = False
-            
             if database_url and database_url.strip():
                 logger.info(f"Using PostgreSQL from DATABASE_URL")
                 db_url = database_url.strip()
@@ -212,8 +214,23 @@ class DatabaseManager:
             
             logger.info("✅ Database initialized successfully")
             
+        except ValueError as e:
+            logger.error(f"Configuration error during database initialization: {e}")
+            raise DatabaseError(f"Database configuration failed: {e}")
+        except OperationalError as e:
+            logger.error(f"Operational error during database initialization (connection/timeout): {e}")
+            raise DatabaseError(f"Database connection failed: {e}")
+        except IntegrityError as e:
+            logger.error(f"Integrity error during database initialization: {e}")
+            raise DatabaseError(f"Database integrity error: {e}")
+        except SQLAlchemyError as e:
+            logger.error(f"SQLAlchemy error during database initialization: {e}")
+            raise DatabaseError(f"Database initialization failed: {e}")
+        except OSError as e:
+            logger.error(f"OS error during database initialization (file/directory): {e}")
+            raise DatabaseError(f"Database file system error: {e}")
         except Exception as e:
-            logger.error(f"Failed to initialize database: {type(e).__name__}: {e}")
+            logger.error(f"Unexpected error during database initialization: {type(e).__name__}: {e}")
             raise DatabaseError(f"Database initialization failed: {e}")
     
     def _configure_database(self):
@@ -231,8 +248,14 @@ class DatabaseManager:
                 conn.execute(text('PRAGMA page_size=4096'))
                 conn.commit()
                 logger.debug("SQLite configuration applied successfully")
+        except OperationalError as e:
+            logger.error(f"Operational error configuring SQLite database: {e}")
+            raise
+        except SQLAlchemyError as e:
+            logger.error(f"SQLAlchemy error configuring database: {e}")
+            raise
         except Exception as e:
-            logger.error(f"Error configuring database: {e}")
+            logger.error(f"Unexpected error configuring database: {type(e).__name__}: {e}")
             raise
     
     @retry_on_db_error(max_retries=3, initial_delay=0.1)
@@ -242,14 +265,39 @@ class DatabaseManager:
         
         try:
             with self.engine.connect() as conn:
-                self._migrate_trades_table(conn)
-                self._migrate_signal_logs_table(conn)
-                self._migrate_positions_table(conn)
+                try:
+                    self._migrate_trades_table(conn)
+                except (OperationalError, IntegrityError, SQLAlchemyError) as e:
+                    logger.error(f"Migration error on trades table: {type(e).__name__}: {e}")
+                    raise DatabaseError(f"Trades table migration failed: {e}")
+                
+                try:
+                    self._migrate_signal_logs_table(conn)
+                except (OperationalError, IntegrityError, SQLAlchemyError) as e:
+                    logger.error(f"Migration error on signal_logs table: {type(e).__name__}: {e}")
+                    raise DatabaseError(f"Signal logs table migration failed: {e}")
+                
+                try:
+                    self._migrate_positions_table(conn)
+                except (OperationalError, IntegrityError, SQLAlchemyError) as e:
+                    logger.error(f"Migration error on positions table: {type(e).__name__}: {e}")
+                    raise DatabaseError(f"Positions table migration failed: {e}")
                 
             logger.info("✅ Database migrations completed successfully")
-                
+        
+        except DatabaseError:
+            raise
+        except OperationalError as e:
+            logger.error(f"Operational error during database migration: {e}")
+            raise DatabaseError(f"Migration failed (connection/lock issue): {e}")
+        except IntegrityError as e:
+            logger.error(f"Integrity error during database migration: {e}")
+            raise DatabaseError(f"Migration failed (data integrity issue): {e}")
+        except SQLAlchemyError as e:
+            logger.error(f"SQLAlchemy error during database migration: {e}")
+            raise DatabaseError(f"Migration failed: {e}")
         except Exception as e:
-            logger.error(f"Error during database migration: {type(e).__name__}: {e}")
+            logger.error(f"Unexpected error during database migration: {type(e).__name__}: {e}")
             raise DatabaseError(f"Migration failed: {e}")
     
     def _migrate_trades_table(self, conn):
@@ -430,6 +478,7 @@ class DatabaseManager:
                 # auto-commit on success, auto-rollback on failure
         """
         session = self.Session()
+        transaction_exception = None
         
         try:
             if isolation_level and self.is_postgres:
@@ -438,12 +487,45 @@ class DatabaseManager:
             yield session
             session.commit()
             
+        except IntegrityError as e:
+            transaction_exception = e
+            try:
+                session.rollback()
+            except Exception as rollback_error:
+                logger.error(f"Error during rollback after IntegrityError: {rollback_error}")
+            logger.error(f"Transaction rolled back due to integrity error: {e}")
+            raise
+        except OperationalError as e:
+            transaction_exception = e
+            try:
+                session.rollback()
+            except Exception as rollback_error:
+                logger.error(f"Error during rollback after OperationalError: {rollback_error}")
+            logger.error(f"Transaction rolled back due to operational error: {e}")
+            raise
+        except SQLAlchemyError as e:
+            transaction_exception = e
+            try:
+                session.rollback()
+            except Exception as rollback_error:
+                logger.error(f"Error during rollback after SQLAlchemyError: {rollback_error}")
+            logger.error(f"Transaction rolled back due to SQLAlchemy error: {e}")
+            raise
         except Exception as e:
-            session.rollback()
+            transaction_exception = e
+            try:
+                session.rollback()
+            except Exception as rollback_error:
+                logger.error(f"Error during rollback: {rollback_error}")
             logger.error(f"Transaction rolled back: {type(e).__name__}: {e}")
             raise
         finally:
-            session.close()
+            try:
+                session.close()
+            except Exception as close_error:
+                logger.error(f"Error closing session: {close_error}")
+                if transaction_exception is None:
+                    raise
     
     @contextmanager
     def serializable_transaction(self) -> Generator:
@@ -476,8 +558,33 @@ class DatabaseManager:
             
             return trade_id
             
+        except IntegrityError as e:
+            try:
+                session.rollback()
+            except Exception as rollback_error:
+                logger.error(f"Error during rollback after IntegrityError: {rollback_error}")
+            logger.error(f"Integrity error creating trade atomically: {e}")
+            raise
+        except OperationalError as e:
+            try:
+                session.rollback()
+            except Exception as rollback_error:
+                logger.error(f"Error during rollback after OperationalError: {rollback_error}")
+            logger.error(f"Operational error creating trade atomically: {e}")
+            raise
+        except SQLAlchemyError as e:
+            try:
+                session.rollback()
+            except Exception as rollback_error:
+                logger.error(f"Error during rollback after SQLAlchemyError: {rollback_error}")
+            logger.error(f"SQLAlchemy error creating trade atomically: {e}")
+            raise
         except Exception as e:
-            logger.error(f"Error creating trade atomically: {e}")
+            try:
+                session.rollback()
+            except Exception as rollback_error:
+                logger.error(f"Error during rollback: {rollback_error}")
+            logger.error(f"Unexpected error creating trade atomically: {type(e).__name__}: {e}")
             raise
     
     def atomic_create_position(self, session, position_data: dict) -> Optional[int]:
@@ -501,8 +608,33 @@ class DatabaseManager:
             
             return position_id
             
+        except IntegrityError as e:
+            try:
+                session.rollback()
+            except Exception as rollback_error:
+                logger.error(f"Error during rollback after IntegrityError: {rollback_error}")
+            logger.error(f"Integrity error creating position atomically: {e}")
+            raise
+        except OperationalError as e:
+            try:
+                session.rollback()
+            except Exception as rollback_error:
+                logger.error(f"Error during rollback after OperationalError: {rollback_error}")
+            logger.error(f"Operational error creating position atomically: {e}")
+            raise
+        except SQLAlchemyError as e:
+            try:
+                session.rollback()
+            except Exception as rollback_error:
+                logger.error(f"Error during rollback after SQLAlchemyError: {rollback_error}")
+            logger.error(f"SQLAlchemy error creating position atomically: {e}")
+            raise
         except Exception as e:
-            logger.error(f"Error creating position atomically: {e}")
+            try:
+                session.rollback()
+            except Exception as rollback_error:
+                logger.error(f"Error during rollback: {rollback_error}")
+            logger.error(f"Unexpected error creating position atomically: {type(e).__name__}: {e}")
             raise
     
     def close(self):

@@ -1,12 +1,39 @@
 import asyncio
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List
+from collections import deque
+import time
 import pytz
 from bot.logger import setup_logger
 from bot.database import Trade, Position
-from bot.resilience import RateLimiter
+from bot.resilience import RateLimiter, CircuitBreaker
 
 logger = setup_logger('AlertSystem')
+
+MAX_QUEUE_SIZE = 100
+MAX_HISTORY_SIZE = 100
+SEND_TIMEOUT_SECONDS = 30
+MAX_RETRY_ATTEMPTS = 3
+BASE_BACKOFF_SECONDS = 1.0
+MAX_BACKOFF_SECONDS = 60.0
+HISTORY_CLEANUP_INTERVAL_SECONDS = 300
+
+
+class AlertPriority:
+    """Alert priority levels for queue management"""
+    CRITICAL = 0
+    HIGH = 1
+    NORMAL = 2
+    LOW = 3
+
+
+CRITICAL_ALERT_TYPES = frozenset({
+    "STOP_LOSS_HIT",
+    "TAKE_PROFIT_HIT", 
+    "SYSTEM_ERROR",
+    "RISK_WARNING"
+})
+
 
 class AlertType:
     TRADE_ENTRY = "TRADE_ENTRY"
@@ -20,6 +47,7 @@ class AlertType:
     MARKET_CLOSE = "MARKET_CLOSE"
     HIGH_VOLATILITY = "HIGH_VOLATILITY"
 
+
 class Alert:
     def __init__(self, alert_type: str, message: str, priority: str = "NORMAL",
                  data: Optional[Dict] = None):
@@ -29,6 +57,8 @@ class Alert:
         self.data = data or {}
         self.timestamp = datetime.now(pytz.UTC)
         self.sent = False
+        self.retry_count = 0
+        self.last_error: Optional[str] = None
     
     def to_dict(self):
         return {
@@ -37,21 +67,46 @@ class Alert:
             'priority': self.priority,
             'data': self.data,
             'timestamp': self.timestamp.isoformat(),
-            'sent': self.sent
+            'sent': self.sent,
+            'retry_count': self.retry_count,
+            'last_error': self.last_error
         }
+
 
 class AlertSystem:
     def __init__(self, config, db_manager):
         self.config = config
         self.db = db_manager
-        self.alert_queue = []
-        self.alert_history = []
+        self.alert_queue: list = []
+        self.alert_history: deque = deque(maxlen=MAX_HISTORY_SIZE)
         self.telegram_app = None
         self.chat_ids = []
         self.enabled = True
-        self.max_history = 100
+        self.max_history = MAX_HISTORY_SIZE
+        self.max_queue_size = MAX_QUEUE_SIZE
         self.send_message_callback = None
-        logger.info("Alert system initialized")
+        
+        self.rate_limiter = RateLimiter(
+            max_calls=30,
+            time_window=60.0,
+            name="AlertRateLimiter"
+        )
+        
+        self.circuit_breaker = CircuitBreaker(
+            failure_threshold=5,
+            recovery_timeout=60.0,
+            expected_exception=Exception,
+            name="AlertCircuitBreaker"
+        )
+        
+        self._current_backoff = BASE_BACKOFF_SECONDS
+        self._failed_sends = 0
+        self._total_dropped = 0
+        self._total_rejected = 0
+        self._critical_dropped = 0
+        self._last_history_cleanup = time.time()
+        
+        logger.info(f"Alert system initialized (max_queue={MAX_QUEUE_SIZE}, max_history={MAX_HISTORY_SIZE})")
     
     def set_telegram_app(self, app, chat_ids: List[int], send_message_callback=None):
         self.telegram_app = app
@@ -59,52 +114,249 @@ class AlertSystem:
         self.send_message_callback = send_message_callback
         logger.info(f"Telegram app set with {len(chat_ids)} chat IDs")
     
-    async def send_alert(self, alert: Alert):
+    def _get_priority_value(self, alert: Alert) -> int:
+        """Get numeric priority for an alert (lower = higher priority)."""
+        if alert.alert_type in CRITICAL_ALERT_TYPES:
+            return AlertPriority.CRITICAL
+        priority_map = {
+            "HIGH": AlertPriority.HIGH,
+            "NORMAL": AlertPriority.NORMAL,
+            "LOW": AlertPriority.LOW,
+            "CRITICAL": AlertPriority.CRITICAL
+        }
+        return priority_map.get(alert.priority, AlertPriority.NORMAL)
+    
+    def _is_critical_alert(self, alert: Alert) -> bool:
+        """Check if an alert is critical and should never be dropped."""
+        return (alert.alert_type in CRITICAL_ALERT_TYPES or 
+                alert.priority == "CRITICAL" or
+                self._get_priority_value(alert) == AlertPriority.CRITICAL)
+    
+    def _try_enqueue_alert(self, alert: Alert) -> tuple[bool, str]:
+        """Try to enqueue an alert with priority-aware overflow handling.
+        
+        Returns:
+            Tuple of (success, reason_if_failed)
+        """
+        is_critical = self._is_critical_alert(alert)
+        
+        if len(self.alert_queue) < self.max_queue_size:
+            self.alert_queue.append(alert)
+            return True, ""
+        
+        if is_critical:
+            non_critical_idx = None
+            for i in range(len(self.alert_queue) - 1, -1, -1):
+                if not self._is_critical_alert(self.alert_queue[i]):
+                    non_critical_idx = i
+                    break
+            
+            if non_critical_idx is not None:
+                dropped_alert = self.alert_queue.pop(non_critical_idx)
+                self._total_dropped += 1
+                logger.warning(
+                    f"Queue full: Dropped LOW priority alert '{dropped_alert.alert_type}' "
+                    f"to make room for CRITICAL alert '{alert.alert_type}'"
+                )
+                self.alert_queue.append(alert)
+                return True, ""
+            else:
+                self._critical_dropped += 1
+                logger.error(
+                    f"CRITICAL ALERT DROPPED: Queue full of critical alerts. "
+                    f"Alert type: {alert.alert_type}, Message: {alert.message[:100]}..."
+                )
+                return False, "Queue full of critical alerts"
+        else:
+            self._total_rejected += 1
+            logger.warning(
+                f"Alert REJECTED due to queue overflow: {alert.alert_type} "
+                f"(queue_size={len(self.alert_queue)}, rejected_total={self._total_rejected})"
+            )
+            return False, "Queue at capacity, non-critical alert rejected"
+    
+    def _calculate_backoff(self) -> float:
+        """Calculate exponential backoff delay."""
+        backoff = min(
+            BASE_BACKOFF_SECONDS * (2 ** self._failed_sends),
+            MAX_BACKOFF_SECONDS
+        )
+        return backoff
+    
+    def _reset_backoff(self):
+        """Reset backoff after successful send."""
+        self._current_backoff = BASE_BACKOFF_SECONDS
+        self._failed_sends = 0
+    
+    def _increment_backoff(self):
+        """Increment backoff after failed send."""
+        self._failed_sends += 1
+        self._current_backoff = self._calculate_backoff()
+        logger.warning(
+            f"Send failed. Backoff increased to {self._current_backoff:.1f}s "
+            f"(failures: {self._failed_sends})"
+        )
+    
+    async def _cleanup_old_history(self):
+        """Periodically cleanup old history entries."""
+        current_time = time.time()
+        if current_time - self._last_history_cleanup >= HISTORY_CLEANUP_INTERVAL_SECONDS:
+            cutoff_time = datetime.now(pytz.UTC) - timedelta(hours=24)
+            
+            old_count = len(self.alert_history)
+            new_history = deque(
+                [a for a in self.alert_history if a.timestamp > cutoff_time],
+                maxlen=MAX_HISTORY_SIZE
+            )
+            removed_count = old_count - len(new_history)
+            
+            if removed_count > 0:
+                self.alert_history = new_history
+                logger.info(f"Cleaned up {removed_count} old history entries")
+            
+            self._last_history_cleanup = current_time
+    
+    async def send_alert(self, alert: Alert) -> bool:
+        """Send an alert. Returns True if alert was successfully queued.
+        
+        Args:
+            alert: The alert to send
+            
+        Returns:
+            True if alert was queued and processed, False if rejected
+        """
         if not self.enabled:
             logger.info(f"Alert system disabled, skipping: {alert.alert_type}")
-            return
+            return False
         
-        self.alert_queue.append(alert)
-        logger.info(f"Alert queued: {alert.alert_type} - {alert.message}")
+        success, reason = self._try_enqueue_alert(alert)
+        if not success:
+            logger.warning(f"Alert not queued: {reason}")
+            return False
+        
+        logger.info(
+            f"Alert queued: {alert.alert_type} - Queue size: {len(self.alert_queue)} "
+            f"(critical={self._is_critical_alert(alert)})"
+        )
+        
+        await self._cleanup_old_history()
         
         await self._process_alert(alert)
+        return True
+    
+    async def _send_with_timeout(self, chat_id: int, formatted_msg: str) -> bool:
+        """Send message with timeout and proper error handling."""
+        try:
+            if self.send_message_callback:
+                await asyncio.wait_for(
+                    self.send_message_callback(
+                        chat_id=chat_id,
+                        text=formatted_msg,
+                        parse_mode='Markdown'
+                    ),
+                    timeout=SEND_TIMEOUT_SECONDS
+                )
+            elif self.telegram_app and self.telegram_app.bot:
+                await asyncio.wait_for(
+                    self.telegram_app.bot.send_message(
+                        chat_id=chat_id,
+                        text=formatted_msg,
+                        parse_mode='Markdown'
+                    ),
+                    timeout=SEND_TIMEOUT_SECONDS
+                )
+            return True
+        except asyncio.TimeoutError:
+            logger.error(f"Timeout sending alert to chat {chat_id} after {SEND_TIMEOUT_SECONDS}s")
+            return False
+        except Exception as e:
+            error_name = type(e).__name__
+            if 'RetryAfter' in error_name or 'Flood' in error_name.lower():
+                retry_after = getattr(e, 'retry_after', 30)
+                logger.warning(
+                    f"Telegram rate limit hit for chat {chat_id}. "
+                    f"Retry after {retry_after}s"
+                )
+                await asyncio.sleep(retry_after)
+                return await self._send_with_timeout(chat_id, formatted_msg)
+            else:
+                logger.error(f"Failed to send alert to chat {chat_id}: {e}")
+                return False
     
     async def _process_alert(self, alert: Alert):
         try:
+            if not await self.rate_limiter.acquire_async(wait=True):
+                logger.warning("Rate limit exceeded, waiting before processing alert")
+                await asyncio.sleep(self.rate_limiter.get_wait_time())
+            
+            if self._failed_sends > 0:
+                backoff_time = self._calculate_backoff()
+                logger.info(f"Applying backoff delay: {backoff_time:.1f}s")
+                await asyncio.sleep(backoff_time)
+            
             formatted_msg = self._format_alert_message(alert)
             
-            if self.send_message_callback:
-                for chat_id in self.chat_ids:
-                    try:
-                        await self.send_message_callback(
-                            chat_id=chat_id,
-                            text=formatted_msg,
-                            parse_mode='Markdown'
-                        )
-                        logger.info(f"Alert sent to chat {chat_id}: {alert.alert_type}")
-                    except Exception as e:
-                        logger.error(f"Failed to send alert to chat {chat_id}: {e}")
-            elif self.telegram_app and self.telegram_app.bot:
-                logger.warning("No send_message_callback provided, falling back to direct bot.send_message (not recommended)")
-                for chat_id in self.chat_ids:
-                    try:
-                        await self.telegram_app.bot.send_message(
-                            chat_id=chat_id,
-                            text=formatted_msg,
-                            parse_mode='Markdown'
-                        )
-                        logger.info(f"Alert sent to chat {chat_id}: {alert.alert_type}")
-                    except Exception as e:
-                        logger.error(f"Failed to send alert to chat {chat_id}: {e}")
+            all_sent = True
             
-            alert.sent = True
+            if self.send_message_callback or (self.telegram_app and self.telegram_app.bot):
+                for chat_id in self.chat_ids:
+                    success = False
+                    for attempt in range(MAX_RETRY_ATTEMPTS):
+                        try:
+                            success = await self._send_with_timeout(chat_id, formatted_msg)
+                            if success:
+                                logger.info(f"Alert sent to chat {chat_id}: {alert.alert_type}")
+                                self._reset_backoff()
+                                break
+                            else:
+                                alert.retry_count += 1
+                                if attempt < MAX_RETRY_ATTEMPTS - 1:
+                                    retry_delay = self._calculate_backoff()
+                                    logger.info(
+                                        f"Retrying send to chat {chat_id} "
+                                        f"(attempt {attempt + 2}/{MAX_RETRY_ATTEMPTS}) "
+                                        f"after {retry_delay:.1f}s"
+                                    )
+                                    await asyncio.sleep(retry_delay)
+                                    self._increment_backoff()
+                        except Exception as e:
+                            alert.last_error = str(e)
+                            alert.retry_count += 1
+                            self._increment_backoff()
+                            if attempt < MAX_RETRY_ATTEMPTS - 1:
+                                retry_delay = self._calculate_backoff()
+                                logger.warning(
+                                    f"Send attempt {attempt + 1} failed for chat {chat_id}: {e}. "
+                                    f"Retrying in {retry_delay:.1f}s"
+                                )
+                                await asyncio.sleep(retry_delay)
+                            else:
+                                logger.error(
+                                    f"All {MAX_RETRY_ATTEMPTS} send attempts failed "
+                                    f"for chat {chat_id}: {e}"
+                                )
+                                all_sent = False
+            
+            alert.sent = all_sent
             self.alert_history.append(alert)
             
-            if len(self.alert_history) > self.max_history:
-                self.alert_history = self.alert_history[-self.max_history:]
+            self._remove_processed_alert(alert)
             
         except Exception as e:
             logger.error(f"Error processing alert: {e}")
+            alert.last_error = str(e)
+            self._increment_backoff()
+    
+    def _remove_processed_alert(self, alert: Alert):
+        """Remove processed alert from queue."""
+        try:
+            new_queue = deque(
+                [a for a in self.alert_queue if a is not alert],
+                maxlen=MAX_QUEUE_SIZE
+            )
+            self.alert_queue = new_queue
+        except Exception as e:
+            logger.error(f"Error removing processed alert from queue: {e}")
     
     def _format_alert_message(self, alert: Alert) -> str:
         priority_emoji = {
@@ -274,7 +526,7 @@ class AlertSystem:
         await self.send_alert(alert)
     
     def get_alert_history(self, limit: int = 10) -> List[Dict]:
-        recent_alerts = self.alert_history[-limit:]
+        recent_alerts = list(self.alert_history)[-limit:]
         return [alert.to_dict() for alert in recent_alerts]
     
     def clear_alert_queue(self):
@@ -289,10 +541,23 @@ class AlertSystem:
         self.enabled = False
         logger.info("Alert system disabled")
     
+    def reset_circuit_breaker(self):
+        """Reset circuit breaker manually."""
+        self.circuit_breaker.reset()
+        self._reset_backoff()
+        logger.info("Circuit breaker and backoff reset")
+    
     def get_stats(self) -> Dict:
         return {
             'total_alerts': len(self.alert_history),
             'queued_alerts': len(self.alert_queue),
+            'max_queue_size': self.max_queue_size,
+            'max_history_size': self.max_history,
             'enabled': self.enabled,
-            'chat_ids_count': len(self.chat_ids)
+            'chat_ids_count': len(self.chat_ids),
+            'failed_sends': self._failed_sends,
+            'total_dropped': self._total_dropped,
+            'current_backoff': self._current_backoff,
+            'rate_limiter': self.rate_limiter.get_state(),
+            'circuit_breaker': self.circuit_breaker.get_state()
         }

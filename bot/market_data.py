@@ -178,6 +178,7 @@ class MarketDataClient:
         self.m5_builder = OHLCBuilder(timeframe_minutes=5)
         
         self.candle_lock = asyncio.Lock()
+        self.db_write_lock = asyncio.Lock()
         
         self.reconnect_delay = 3
         self.max_reconnect_delay = 60
@@ -828,78 +829,88 @@ class MarketDataClient:
                 logger.error(f"Error creating candle snapshots: {e}")
                 return False
         
-        try:
-            session = db_manager.get_session()
-            
-            saved_m1 = 0
-            saved_m5 = 0
-            
-            for timeframe in ['M1', 'M5']:
-                all_candles = snapshots[timeframe].copy()
-                
-                current_candle = snapshots.get(timeframe + '_current')
-                if current_candle:
-                    all_candles.append(current_candle)
-                    logger.debug(f"Including current_candle in {timeframe} save (total: {len(all_candles)})")
-                
-                if len(all_candles) == 0:
-                    logger.debug(f"No {timeframe} candles to save")
-                    continue
-                
-                seen_timestamps = set()
-                deduplicated_candles = []
-                for candle in all_candles:
-                    ts = candle['timestamp']
-                    if ts not in seen_timestamps:
-                        seen_timestamps.add(ts)
-                        deduplicated_candles.append(candle)
-                
-                if len(deduplicated_candles) < len(all_candles):
-                    removed = len(all_candles) - len(deduplicated_candles)
-                    logger.debug(f"Removed {removed} duplicate candle(s) from {timeframe} before saving")
-                
-                candles_to_save = deduplicated_candles[-100:]
-                
-                session.execute(delete(CandleData).where(CandleData.timeframe == timeframe))
-                
-                for candle_dict in candles_to_save:
-                    candle_record = CandleData(
-                        timeframe=timeframe,
-                        timestamp=candle_dict['timestamp'],
-                        open=float(candle_dict['open']),
-                        high=float(candle_dict['high']),
-                        low=float(candle_dict['low']),
-                        close=float(candle_dict['close']),
-                        volume=float(candle_dict.get('volume', 0))
-                    )
-                    session.add(candle_record)
-                
-                if timeframe == 'M1':
-                    saved_m1 = len(candles_to_save)
-                else:
-                    saved_m5 = len(candles_to_save)
-            
-            session.commit()
-            session.close()
-            
-            logger.info(f"✅ Saved candles to database: M1={saved_m1}, M5={saved_m5}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error saving candles to database: {e}", exc_info=True)
+        async with self.db_write_lock:
+            session = None
             try:
-                session.rollback()
+                session = db_manager.get_session()
+                
+                saved_m1 = 0
+                saved_m5 = 0
+                
+                for timeframe in ['M1', 'M5']:
+                    all_candles = snapshots[timeframe].copy()
+                    
+                    current_candle = snapshots.get(timeframe + '_current')
+                    if current_candle:
+                        all_candles.append(current_candle)
+                        logger.debug(f"Including current_candle in {timeframe} save (total: {len(all_candles)})")
+                    
+                    if len(all_candles) == 0:
+                        logger.debug(f"No {timeframe} candles to save")
+                        continue
+                    
+                    seen_timestamps = set()
+                    deduplicated_candles = []
+                    for candle in all_candles:
+                        ts = candle['timestamp']
+                        if ts not in seen_timestamps:
+                            seen_timestamps.add(ts)
+                            deduplicated_candles.append(candle)
+                    
+                    if len(deduplicated_candles) < len(all_candles):
+                        removed = len(all_candles) - len(deduplicated_candles)
+                        logger.debug(f"Removed {removed} duplicate candle(s) from {timeframe} before saving")
+                    
+                    seen_timestamps.clear()
+                    
+                    candles_to_save = deduplicated_candles[-100:]
+                    
+                    session.execute(delete(CandleData).where(CandleData.timeframe == timeframe))
+                    
+                    for candle_dict in candles_to_save:
+                        candle_record = CandleData(
+                            timeframe=timeframe,
+                            timestamp=candle_dict['timestamp'],
+                            open=float(candle_dict['open']),
+                            high=float(candle_dict['high']),
+                            low=float(candle_dict['low']),
+                            close=float(candle_dict['close']),
+                            volume=float(candle_dict.get('volume', 0))
+                        )
+                        session.add(candle_record)
+                    
+                    if timeframe == 'M1':
+                        saved_m1 = len(candles_to_save)
+                    else:
+                        saved_m5 = len(candles_to_save)
+                
+                session.commit()
                 session.close()
-            except:
-                pass
-            return False
+                
+                logger.info(f"✅ Saved candles to database: M1={saved_m1}, M5={saved_m5}")
+                return True
+                
+            except Exception as e:
+                logger.error(f"Error saving candles to database: {e}", exc_info=True)
+                if session is not None:
+                    try:
+                        session.rollback()
+                        session.close()
+                    except:
+                        pass
+                return False
     
     async def load_candles_from_db(self, db_manager):
-        """Load candles from database on startup with race condition protection"""
+        """Load candles from database on startup with race condition protection
+        
+        Memory optimization: Uses sliding window deque for duplicate detection
+        instead of unbounded set to prevent large memory consumption.
+        """
         self._loading_from_db = True
         logger.debug("Set _loading_from_db=True - blocking WebSocket tick processing")
         
         async with self.candle_lock:
+            session = None
             try:
                 from bot.database import CandleData
                 
@@ -921,7 +932,7 @@ class MarketDataClient:
                         logger.info(f"No {timeframe} candles found in database (first run?)")
                         continue
                     
-                    seen_timestamps = set()
+                    recent_timestamps = deque(maxlen=20)
                     duplicates_skipped = 0
                     
                     for candle in candles:
@@ -932,12 +943,12 @@ class MarketDataClient:
                         else:
                             ts = pd.Timestamp(timestamp).tz_convert('UTC')
                         
-                        if ts in seen_timestamps:
+                        if ts in recent_timestamps:
                             duplicates_skipped += 1
                             logger.debug(f"Skipping duplicate candle at {ts} for {timeframe}")
                             continue
                         
-                        seen_timestamps.add(ts)
+                        recent_timestamps.append(ts)
                         
                         candle_dict = {
                             'timestamp': ts,
@@ -948,6 +959,8 @@ class MarketDataClient:
                             'volume': float(candle.volume) if candle.volume else 0
                         }
                         builder.candles.append(candle_dict)
+                    
+                    recent_timestamps.clear()
                     
                     if duplicates_skipped > 0:
                         logger.info(f"Skipped {duplicates_skipped} duplicate candle(s) from {timeframe} during load")
@@ -982,16 +995,37 @@ class MarketDataClient:
             except Exception as e:
                 logger.error(f"Error loading candles from database: {e}", exc_info=True)
                 logger.warning("Falling back to fetching candles from Deriv API")
-                try:
-                    session.close()
-                except:
-                    pass
+                if session is not None:
+                    try:
+                        session.close()
+                    except:
+                        pass
                 self._loading_from_db = False
                 logger.debug("Set _loading_from_db=False - WebSocket tick processing enabled (after error)")
                 return False
     
     def _prune_old_candles(self, db_manager, keep_count: int = 150):
-        """Prune old candles from database to prevent bloat"""
+        """Prune old candles from database to prevent bloat
+        
+        Args:
+            db_manager: Database manager instance
+            keep_count: Number of newest candles to keep per timeframe (default: 150)
+                       Must be >= 1 and <= 10000
+        
+        Returns:
+            Number of pruned candles, or 0 on error
+        """
+        if keep_count is None or not isinstance(keep_count, int):
+            logger.warning(f"Invalid keep_count type: {type(keep_count)}. Using default 150")
+            keep_count = 150
+        elif keep_count < 1:
+            logger.warning(f"Invalid keep_count: {keep_count}. Must be >= 1. Using default 150")
+            keep_count = 150
+        elif keep_count > 10000:
+            logger.warning(f"keep_count too large: {keep_count}. Capping at 10000")
+            keep_count = 10000
+        
+        session = None
         try:
             from bot.database import CandleData
             from sqlalchemy import func
@@ -1005,38 +1039,47 @@ class MarketDataClient:
                     CandleData.timeframe == timeframe
                 ).scalar()
                 
-                if total_count <= keep_count:
+                if total_count is None or total_count <= keep_count:
+                    logger.debug(f"{timeframe}: {total_count or 0} candles <= keep_count ({keep_count}), skipping prune")
                     continue
+                
+                excess_count = total_count - keep_count
+                logger.debug(f"{timeframe}: {total_count} candles, need to prune {excess_count}")
                 
                 candles = session.query(CandleData).filter(
                     CandleData.timeframe == timeframe
                 ).order_by(CandleData.timestamp.desc()).limit(keep_count).all()
                 
-                if candles:
+                if candles and len(candles) > 0:
                     oldest_to_keep = candles[-1].timestamp
                     
                     deleted = session.query(CandleData).filter(
                         CandleData.timeframe == timeframe,
                         CandleData.timestamp < oldest_to_keep
-                    ).delete()
+                    ).delete(synchronize_session=False)
                     
+                    if deleted > 0:
+                        logger.debug(f"{timeframe}: Deleted {deleted} candles older than {oldest_to_keep}")
                     pruned_total += deleted
+                else:
+                    logger.warning(f"{timeframe}: Failed to get candles for pruning reference")
             
             session.commit()
             session.close()
             
             if pruned_total > 0:
-                logger.info(f"Pruned {pruned_total} old candles from database")
+                logger.info(f"Pruned {pruned_total} old candles from database (keep_count={keep_count})")
             
             return pruned_total
             
         except Exception as e:
-            logger.error(f"Error pruning old candles: {e}")
-            try:
-                session.rollback()
-                session.close()
-            except:
-                pass
+            logger.error(f"Error pruning old candles: {e}", exc_info=True)
+            if session is not None:
+                try:
+                    session.rollback()
+                    session.close()
+                except:
+                    pass
             return 0
     
     def disconnect(self):

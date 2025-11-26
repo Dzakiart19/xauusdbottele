@@ -2,9 +2,11 @@ import os
 import json
 import hashlib
 import time
+import math
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Callable
 from functools import wraps
+from collections import OrderedDict
 import pytz
 from bot.logger import setup_logger
 
@@ -80,9 +82,27 @@ def calculate_percentage_change(old_value: float, new_value: float) -> float:
 def safe_divide(numerator: float, denominator: float, default: float = 0.0) -> float:
     try:
         if denominator == 0:
+            logger.debug("safe_divide: Division by zero, returning default")
             return default
-        return numerator / denominator
-    except:
+        
+        result = numerator / denominator
+        
+        if math.isnan(result):
+            logger.debug("safe_divide: Result is NaN, returning default")
+            return default
+        if math.isinf(result):
+            logger.debug("safe_divide: Result is Inf, returning default")
+            return default
+        
+        return result
+    except ZeroDivisionError:
+        logger.debug("safe_divide: ZeroDivisionError caught, returning default")
+        return default
+    except TypeError as e:
+        logger.warning(f"safe_divide: TypeError - invalid operand types: {e}")
+        return default
+    except Exception as e:
+        logger.error(f"safe_divide: Unexpected error ({type(e).__name__}): {e}")
         return default
 
 def truncate_string(text: str, max_length: int = 100, suffix: str = '...') -> str:
@@ -101,28 +121,51 @@ def hash_string(text: str, algorithm: str = 'md5') -> str:
 @retry(max_retries=3, backoff_factor=2.0, exceptions=(IOError, OSError))
 def save_json(data: Dict, filepath: str) -> bool:
     try:
-        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        dir_path = os.path.dirname(filepath)
+        if dir_path:
+            os.makedirs(dir_path, exist_ok=True)
         with open(filepath, 'w') as f:
             json.dump(data, f, indent=4, default=str)
         logger.info(f"JSON saved to {filepath}")
         return True
+    except PermissionError as e:
+        logger.error(f"PermissionError saving JSON to {filepath}: {e}")
+        return False
+    except TypeError as e:
+        logger.error(f"TypeError serializing JSON data: {e}")
+        return False
+    except OSError as e:
+        logger.error(f"OSError saving JSON to {filepath}: {e}")
+        return False
     except Exception as e:
-        logger.error(f"Error saving JSON: {e}")
+        logger.error(f"Unexpected error ({type(e).__name__}) saving JSON to {filepath}: {e}")
         return False
 
 @retry(max_retries=3, backoff_factor=2.0, exceptions=(IOError, OSError))
 def load_json(filepath: str) -> Optional[Dict]:
     try:
         if not os.path.exists(filepath):
-            logger.warning(f"File not found: {filepath}")
+            logger.warning(f"FileNotFoundError: File not found: {filepath}")
             return None
         
         with open(filepath, 'r') as f:
             data = json.load(f)
         logger.info(f"JSON loaded from {filepath}")
         return data
+    except FileNotFoundError as e:
+        logger.error(f"FileNotFoundError loading JSON from {filepath}: {e}")
+        return None
+    except PermissionError as e:
+        logger.error(f"PermissionError loading JSON from {filepath}: {e}")
+        return None
+    except json.JSONDecodeError as e:
+        logger.error(f"JSONDecodeError parsing JSON from {filepath}: {e}")
+        return None
+    except OSError as e:
+        logger.error(f"OSError loading JSON from {filepath}: {e}")
+        return None
     except Exception as e:
-        logger.error(f"Error loading JSON: {e}")
+        logger.error(f"Unexpected error ({type(e).__name__}) loading JSON from {filepath}: {e}")
         return None
 
 @retry(max_retries=3, backoff_factor=2.0, exceptions=(IOError, OSError))
@@ -135,28 +178,77 @@ def ensure_directory_exists(directory: str) -> bool:
         return False
 
 @retry(max_retries=3, backoff_factor=2.0, exceptions=(IOError, OSError))
-def cleanup_files(directory: str, pattern: str = '*', days_old: int = 7) -> int:
+def cleanup_files(directory: str, pattern: str = '*', days_old: int = 7, 
+                  recursive: bool = False, max_depth: int = 10) -> int:
     import glob
     deleted_count = 0
     
     try:
-        pattern_path = os.path.join(directory, pattern)
-        files = glob.glob(pattern_path)
+        if not os.path.exists(directory):
+            logger.warning(f"Directory not found for cleanup: {directory}")
+            return 0
+        
         now = datetime.now()
         
-        for filepath in files:
-            if os.path.isfile(filepath):
-                file_time = datetime.fromtimestamp(os.path.getmtime(filepath))
-                if (now - file_time).days > days_old:
-                    os.remove(filepath)
-                    deleted_count += 1
-                    logger.info(f"Deleted old file: {filepath}")
+        if recursive:
+            dirs_to_process = [(directory, 0)]
+            
+            while dirs_to_process:
+                current_dir, current_depth = dirs_to_process.pop(0)
+                
+                if current_depth > max_depth:
+                    logger.warning(f"Max depth {max_depth} reached at {current_dir}, skipping deeper directories")
+                    continue
+                
+                pattern_path = os.path.join(current_dir, pattern)
+                items = glob.glob(pattern_path)
+                
+                for item_path in items:
+                    if os.path.isfile(item_path):
+                        try:
+                            file_time = datetime.fromtimestamp(os.path.getmtime(item_path))
+                            if (now - file_time).days > days_old:
+                                os.remove(item_path)
+                                deleted_count += 1
+                                logger.info(f"Deleted old file: {item_path}")
+                        except PermissionError as e:
+                            logger.warning(f"PermissionError deleting {item_path}: {e}")
+                        except FileNotFoundError:
+                            logger.debug(f"File already deleted: {item_path}")
+                        except OSError as e:
+                            logger.warning(f"OSError deleting {item_path}: {e}")
+                    elif os.path.isdir(item_path):
+                        dirs_to_process.append((item_path, current_depth + 1))
+        else:
+            pattern_path = os.path.join(directory, pattern)
+            files = glob.glob(pattern_path)
+            
+            for filepath in files:
+                if os.path.isfile(filepath):
+                    try:
+                        file_time = datetime.fromtimestamp(os.path.getmtime(filepath))
+                        if (now - file_time).days > days_old:
+                            os.remove(filepath)
+                            deleted_count += 1
+                            logger.info(f"Deleted old file: {filepath}")
+                    except PermissionError as e:
+                        logger.warning(f"PermissionError deleting {filepath}: {e}")
+                    except FileNotFoundError:
+                        logger.debug(f"File already deleted: {filepath}")
+                    except OSError as e:
+                        logger.warning(f"OSError deleting {filepath}: {e}")
         
         logger.info(f"Cleanup completed. Deleted {deleted_count} files from {directory}")
         return deleted_count
         
+    except PermissionError as e:
+        logger.error(f"PermissionError during cleanup of {directory}: {e}")
+        return deleted_count
+    except OSError as e:
+        logger.error(f"OSError during cleanup of {directory}: {e}")
+        return deleted_count
     except Exception as e:
-        logger.error(f"Error during cleanup: {e}")
+        logger.error(f"Unexpected error ({type(e).__name__}) during cleanup: {e}")
         return deleted_count
 
 def validate_price(price: float) -> bool:
@@ -271,21 +363,51 @@ class RateLimiter:
         return (cutoff_time - now).total_seconds()
 
 class Cache:
-    def __init__(self, ttl_seconds: int = 60):
-        self.cache = {}
+    def __init__(self, ttl_seconds: int = 60, max_size: int = 1000):
+        self.cache: OrderedDict = OrderedDict()
         self.ttl = ttl_seconds
+        self.max_size = max_size
     
     def get(self, key: str) -> Optional[Any]:
         if key in self.cache:
             value, timestamp = self.cache[key]
             if (datetime.now() - timestamp).total_seconds() < self.ttl:
+                self.cache.move_to_end(key)
                 return value
             else:
                 del self.cache[key]
         return None
     
     def set(self, key: str, value: Any):
+        if key in self.cache:
+            del self.cache[key]
+        
+        if len(self.cache) >= self.max_size:
+            self._evict_oldest()
+        
         self.cache[key] = (value, datetime.now())
+    
+    def _evict_oldest(self):
+        if self.cache:
+            oldest_key = next(iter(self.cache))
+            del self.cache[oldest_key]
+            logger.debug(f"Cache evicted oldest entry: {oldest_key}")
+    
+    def cleanup_expired(self) -> int:
+        now = datetime.now()
+        expired_keys = []
+        
+        for key, (value, timestamp) in self.cache.items():
+            if (now - timestamp).total_seconds() >= self.ttl:
+                expired_keys.append(key)
+        
+        for key in expired_keys:
+            del self.cache[key]
+        
+        if expired_keys:
+            logger.debug(f"Cache cleanup removed {len(expired_keys)} expired entries")
+        
+        return len(expired_keys)
     
     def clear(self):
         self.cache.clear()
@@ -293,3 +415,9 @@ class Cache:
     def delete(self, key: str):
         if key in self.cache:
             del self.cache[key]
+    
+    def size(self) -> int:
+        return len(self.cache)
+    
+    def is_full(self) -> bool:
+        return len(self.cache) >= self.max_size

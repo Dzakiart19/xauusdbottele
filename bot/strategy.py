@@ -1,4 +1,4 @@
-from typing import Optional, Dict, Tuple, Any
+from typing import Optional, Dict, Tuple, Any, List
 import json
 from bot.logger import setup_logger
 import math
@@ -12,6 +12,117 @@ class StrategyError(Exception):
 class IndicatorValidationError(StrategyError):
     """Indicator data validation error"""
     pass
+
+
+def is_valid_number(value: Any) -> bool:
+    """Check if value is a valid finite number (not None, NaN, or Inf)
+    
+    Args:
+        value: Any value to check
+        
+    Returns:
+        True if value is a valid finite number, False otherwise
+    """
+    if value is None:
+        return False
+    if not isinstance(value, (int, float)):
+        return False
+    try:
+        if math.isnan(value) or math.isinf(value):
+            return False
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+def safe_float(value: Any, default: float = 0.0, name: str = "") -> float:
+    """Safely convert value to float with NaN/Inf protection
+    
+    Args:
+        value: Value to convert
+        default: Default value to return if conversion fails
+        name: Optional name for logging
+        
+    Returns:
+        Float value or default if invalid
+    """
+    if value is None:
+        if name:
+            logger.warning(f"NaN/Inf check: {name} is None, using default {default}")
+        return default
+    
+    try:
+        result = float(value)
+        if math.isnan(result):
+            if name:
+                logger.warning(f"NaN detected in {name}, using default {default}")
+            return default
+        if math.isinf(result):
+            if name:
+                logger.warning(f"Inf detected in {name}, using default {default}")
+            return default
+        return result
+    except (TypeError, ValueError) as e:
+        if name:
+            logger.warning(f"Invalid number in {name}: {e}, using default {default}")
+        return default
+
+
+def safe_divide(numerator: Any, denominator: Any, default: float = 0.0, name: str = "") -> float:
+    """Safely divide two numbers with protection against division by zero and NaN/Inf
+    
+    Args:
+        numerator: The numerator value
+        denominator: The denominator value
+        default: Default value to return if division fails
+        name: Optional name for logging
+        
+    Returns:
+        Division result or default if invalid
+    """
+    num = safe_float(numerator, 0.0)
+    denom = safe_float(denominator, 0.0)
+    
+    if denom == 0.0:
+        if name:
+            logger.warning(f"Division by zero in {name}, using default {default}")
+        return default
+    
+    try:
+        result = num / denom
+        if math.isnan(result) or math.isinf(result):
+            if name:
+                logger.warning(f"NaN/Inf result in {name} division, using default {default}")
+            return default
+        return result
+    except (TypeError, ValueError, ZeroDivisionError, OverflowError) as e:
+        if name:
+            logger.warning(f"Division error in {name}: {e}, using default {default}")
+        return default
+
+
+def validate_rsi_history(rsi_history: Any) -> List[float]:
+    """Validate and clean RSI history list
+    
+    Args:
+        rsi_history: List of RSI values
+        
+    Returns:
+        Cleaned list of valid RSI values (0-100 range)
+    """
+    if not rsi_history or not isinstance(rsi_history, (list, tuple)):
+        return []
+    
+    cleaned = []
+    for val in rsi_history:
+        if is_valid_number(val):
+            if 0 <= val <= 100:
+                cleaned.append(float(val))
+            else:
+                logger.warning(f"RSI history value out of range: {val}, skipping")
+    
+    return cleaned
+
 
 def validate_indicator_value(name: str, value: Any, min_val: Optional[float] = None, max_val: Optional[float] = None) -> Tuple[bool, Optional[str]]:
     """Validate individual indicator value with range checks"""
@@ -78,6 +189,20 @@ def validate_indicators(indicators: Dict) -> Tuple[bool, Optional[str]]:
                 if not is_valid:
                     return False, error
         
+        stoch_k = indicators.get('stoch_k')
+        if stoch_k is not None:
+            is_valid, error = validate_indicator_value('stoch_k', stoch_k, min_val=0, max_val=100)
+            if not is_valid:
+                logger.warning(f"Stochastic K validation failed: {error}")
+                return False, error
+        
+        stoch_d = indicators.get('stoch_d')
+        if stoch_d is not None:
+            is_valid, error = validate_indicator_value('stoch_d', stoch_d, min_val=0, max_val=100)
+            if not is_valid:
+                logger.warning(f"Stochastic D validation failed: {error}")
+                return False, error
+        
         return True, None
         
     except Exception as e:
@@ -94,61 +219,90 @@ class TradingStrategy:
         
         Returns: (strength_score, description)
         """
+        default_score = 0.3
+        default_desc = "MEDIUM ⚡"
+        
         try:
+            if not indicators or not isinstance(indicators, dict):
+                logger.warning("calculate_trend_strength: Invalid indicators dict, returning default")
+                return default_score, default_desc
+            
             is_valid, error_msg = validate_indicators(indicators)
             if not is_valid:
                 logger.warning(f"Indicator validation failed in trend strength calculation: {error_msg}")
-                return 0.3, "MEDIUM ⚡"
+                return default_score, default_desc
             
             score = 0.0
             factors = []
             
-            ema_short = indicators.get(f'ema_{self.config.EMA_PERIODS[0]}')
-            ema_mid = indicators.get(f'ema_{self.config.EMA_PERIODS[1]}')
-            ema_long = indicators.get(f'ema_{self.config.EMA_PERIODS[2]}')
-            macd_histogram = indicators.get('macd_histogram')
-            rsi = indicators.get('rsi')
-            atr = indicators.get('atr')
-            close = indicators.get('close')
-            volume = indicators.get('volume')
-            volume_avg = indicators.get('volume_avg')
+            ema_short_raw = indicators.get(f'ema_{self.config.EMA_PERIODS[0]}')
+            ema_mid_raw = indicators.get(f'ema_{self.config.EMA_PERIODS[1]}')
+            ema_long_raw = indicators.get(f'ema_{self.config.EMA_PERIODS[2]}')
+            macd_histogram_raw = indicators.get('macd_histogram')
+            rsi_raw = indicators.get('rsi')
+            close_raw = indicators.get('close')
+            volume_raw = indicators.get('volume')
+            volume_avg_raw = indicators.get('volume_avg')
+            
+            ema_short = safe_float(ema_short_raw, 0.0) if is_valid_number(ema_short_raw) else None
+            ema_mid = safe_float(ema_mid_raw, 0.0) if is_valid_number(ema_mid_raw) else None
+            ema_long = safe_float(ema_long_raw, 0.0) if is_valid_number(ema_long_raw) else None
+            close = safe_float(close_raw, 0.0) if is_valid_number(close_raw) else None
             
             if (ema_short is not None and ema_mid is not None and 
                 ema_long is not None and close is not None and close > 0):
-                ema_separation = abs(ema_short - ema_long) / close
-                if ema_separation > 0.003:
-                    score += 0.25
-                    factors.append("EMA spread lebar")
-                elif ema_separation > 0.0015:
-                    score += 0.15
-                    factors.append("EMA spread medium")
+                ema_separation = safe_divide(abs(ema_short - ema_long), close, 0.0, "ema_separation")
+                if is_valid_number(ema_separation):
+                    if ema_separation > 0.003:
+                        score += 0.25
+                        factors.append("EMA spread lebar")
+                    elif ema_separation > 0.0015:
+                        score += 0.15
+                        factors.append("EMA spread medium")
             
-            if macd_histogram is not None:
+            if is_valid_number(macd_histogram_raw):
+                macd_histogram = safe_float(macd_histogram_raw, 0.0)
                 macd_strength = abs(macd_histogram)
-                if macd_strength > 0.5:
-                    score += 0.25
-                    factors.append("MACD histogram kuat")
-                elif macd_strength > 0.2:
-                    score += 0.15
-                    factors.append("MACD histogram medium")
+                if is_valid_number(macd_strength):
+                    if macd_strength > 0.5:
+                        score += 0.25
+                        factors.append("MACD histogram kuat")
+                    elif macd_strength > 0.2:
+                        score += 0.15
+                        factors.append("MACD histogram medium")
             
-            if rsi is not None:
-                rsi_momentum = abs(rsi - 50) / 50
-                if rsi_momentum > 0.4:
-                    score += 0.25
-                    factors.append("RSI momentum tinggi")
-                elif rsi_momentum > 0.2:
-                    score += 0.15
-                    factors.append("RSI momentum medium")
+            if is_valid_number(rsi_raw):
+                rsi = safe_float(rsi_raw, 50.0)
+                if 0 <= rsi <= 100:
+                    rsi_momentum = safe_divide(abs(rsi - 50), 50, 0.0, "rsi_momentum")
+                    if is_valid_number(rsi_momentum):
+                        if rsi_momentum > 0.4:
+                            score += 0.25
+                            factors.append("RSI momentum tinggi")
+                        elif rsi_momentum > 0.2:
+                            score += 0.15
+                            factors.append("RSI momentum medium")
+                else:
+                    logger.warning(f"RSI out of range in trend strength: {rsi}")
             
-            if volume is not None and volume_avg is not None and volume_avg > 0:
-                volume_ratio = volume / volume_avg
-                if volume_ratio > 1.5:
-                    score += 0.25
-                    factors.append("Volume sangat tinggi")
-                elif volume_ratio > 1.0:
-                    score += 0.15
-                    factors.append("Volume tinggi")
+            if is_valid_number(volume_raw) and is_valid_number(volume_avg_raw):
+                volume = safe_float(volume_raw, 0.0)
+                volume_avg = safe_float(volume_avg_raw, 0.0)
+                if volume_avg > 0:
+                    volume_ratio = safe_divide(volume, volume_avg, 0.0, "volume_ratio")
+                    if is_valid_number(volume_ratio):
+                        if volume_ratio > 1.5:
+                            score += 0.25
+                            factors.append("Volume sangat tinggi")
+                        elif volume_ratio > 1.0:
+                            score += 0.15
+                            factors.append("Volume tinggi")
+            
+            if math.isnan(score) or math.isinf(score):
+                logger.warning(f"NaN/Inf detected in trend strength score, returning default")
+                return default_score, default_desc
+            
+            score = min(max(score, 0.0), 1.0)
             
             if score >= 0.75:
                 description = "SANGAT KUAT 🔥"
@@ -159,23 +313,36 @@ class TradingStrategy:
             else:
                 description = "LEMAH 📊"
             
-            return min(score, 1.0), description
+            return score, description
             
         except Exception as e:
             logger.error(f"Error calculating trend strength: {e}")
             logger.warning(f"Trend strength calculation fallback triggered: Using default MEDIUM score due to error: {str(e)}")
-            return 0.3, "MEDIUM ⚡"
+            return default_score, default_desc
     
     def check_high_volatility(self, indicators: Dict):
         """Check for high volatility and send alert if detected"""
         try:
-            atr = indicators.get('atr')
-            close = indicators.get('close')
-            
-            if atr is None or close is None or close <= 0:
+            if not indicators or not isinstance(indicators, dict):
                 return
             
-            volatility_percent = (atr / close) * 100
+            atr_raw = indicators.get('atr')
+            close_raw = indicators.get('close')
+            
+            if not is_valid_number(atr_raw) or not is_valid_number(close_raw):
+                return
+            
+            atr = safe_float(atr_raw, 0.0)
+            close = safe_float(close_raw, 0.0)
+            
+            if atr <= 0 or close <= 0:
+                return
+            
+            volatility_percent = safe_divide(atr, close, 0.0, "volatility_percent") * 100
+            
+            if not is_valid_number(volatility_percent):
+                logger.warning("NaN/Inf detected in volatility calculation, skipping alert")
+                return
             
             high_volatility_threshold = 0.15
             
@@ -218,16 +385,29 @@ class TradingStrategy:
             True if pullback confirmed, False otherwise
         """
         try:
-            if not rsi_history or len(rsi_history) < 5:
+            if signal_type not in ['BUY', 'SELL']:
+                logger.warning(f"Invalid signal_type in pullback confirmation: {signal_type}")
+                return False
+            
+            cleaned_history = validate_rsi_history(rsi_history)
+            
+            if len(cleaned_history) < 5:
+                return False
+            
+            recent_history = cleaned_history[-10:] if len(cleaned_history) >= 10 else cleaned_history
+            current_rsi = cleaned_history[-1]
+            
+            if not is_valid_number(current_rsi):
+                logger.warning("Invalid current RSI in pullback confirmation")
                 return False
             
             if signal_type == 'BUY':
-                pullback_detected = any(40 <= rsi <= 45 for rsi in rsi_history[-10:])
-                if pullback_detected and rsi_history[-1] > 45:
+                pullback_detected = any(40 <= rsi <= 45 for rsi in recent_history if is_valid_number(rsi))
+                if pullback_detected and current_rsi > 45:
                     return True
             elif signal_type == 'SELL':
-                pullback_detected = any(55 <= rsi <= 60 for rsi in rsi_history[-10:])
-                if pullback_detected and rsi_history[-1] < 55:
+                pullback_detected = any(55 <= rsi <= 60 for rsi in recent_history if is_valid_number(rsi))
+                if pullback_detected and current_rsi < 55:
                     return True
             
             return False
@@ -331,48 +511,68 @@ class TradingStrategy:
             signal = None
             confidence_reasons = []
             
-            ema_trend_bullish = (ema_short is not None and ema_mid is not None and ema_long is not None and 
+            ema_short_valid = is_valid_number(ema_short)
+            ema_mid_valid = is_valid_number(ema_mid)
+            ema_long_valid = is_valid_number(ema_long)
+            
+            ema_trend_bullish = (ema_short_valid and ema_mid_valid and ema_long_valid and 
                                  ema_short > ema_mid > ema_long)
-            ema_trend_bearish = (ema_short is not None and ema_mid is not None and ema_long is not None and 
+            ema_trend_bearish = (ema_short_valid and ema_mid_valid and ema_long_valid and 
                                  ema_short < ema_mid < ema_long)
             
-            ema_crossover_bullish = (ema_short is not None and ema_mid is not None and 
-                                     ema_short > ema_mid and 
-                                     abs(ema_short - ema_mid) / ema_mid < 0.001)
-            ema_crossover_bearish = (ema_short is not None and ema_mid is not None and 
-                                     ema_short < ema_mid and 
-                                     abs(ema_short - ema_mid) / ema_mid < 0.001)
+            ema_crossover_bullish = False
+            ema_crossover_bearish = False
+            if ema_short_valid and ema_mid_valid and ema_mid > 0:
+                ema_diff_ratio = safe_divide(abs(ema_short - ema_mid), ema_mid, 999.0, "ema_crossover_diff")
+                if is_valid_number(ema_diff_ratio):
+                    ema_crossover_bullish = (ema_short > ema_mid and ema_diff_ratio < 0.001)
+                    ema_crossover_bearish = (ema_short < ema_mid and ema_diff_ratio < 0.001)
             
             macd_bullish_crossover = False
             macd_bearish_crossover = False
-            if macd_prev is not None and macd_signal_prev is not None and macd is not None and macd_signal is not None:
+            macd_valid = is_valid_number(macd)
+            macd_signal_valid = is_valid_number(macd_signal)
+            macd_prev_valid = is_valid_number(macd_prev)
+            macd_signal_prev_valid = is_valid_number(macd_signal_prev)
+            
+            if macd_prev_valid and macd_signal_prev_valid and macd_valid and macd_signal_valid:
                 macd_bullish_crossover = (macd_prev <= macd_signal_prev and macd > macd_signal)
                 macd_bearish_crossover = (macd_prev >= macd_signal_prev and macd < macd_signal)
             
-            macd_bullish = macd is not None and macd_signal is not None and macd > macd_signal
-            macd_bearish = macd is not None and macd_signal is not None and macd < macd_signal
-            macd_above_zero = macd is not None and macd > 0
-            macd_below_zero = macd is not None and macd < 0
+            macd_bullish = macd_valid and macd_signal_valid and macd > macd_signal
+            macd_bearish = macd_valid and macd_signal_valid and macd < macd_signal
+            macd_above_zero = macd_valid and macd > 0
+            macd_below_zero = macd_valid and macd < 0
+            
+            rsi_valid = is_valid_number(rsi) and 0 <= rsi <= 100
+            rsi_prev_valid = is_valid_number(rsi_prev) and 0 <= rsi_prev <= 100
             
             rsi_oversold_crossup = False
             rsi_overbought_crossdown = False
-            if rsi_prev is not None:
+            if rsi_valid and rsi_prev_valid:
                 rsi_oversold_crossup = (rsi_prev < self.config.RSI_OVERSOLD_LEVEL and rsi >= self.config.RSI_OVERSOLD_LEVEL)
                 rsi_overbought_crossdown = (rsi_prev > self.config.RSI_OVERBOUGHT_LEVEL and rsi <= self.config.RSI_OVERBOUGHT_LEVEL)
             
-            rsi_bullish = rsi is not None and rsi > 50
-            rsi_bearish = rsi is not None and rsi < 50
+            rsi_bullish = rsi_valid and rsi > 50
+            rsi_bearish = rsi_valid and rsi < 50
+            
+            stoch_k_valid = is_valid_number(stoch_k) and 0 <= stoch_k <= 100
+            stoch_d_valid = is_valid_number(stoch_d) and 0 <= stoch_d <= 100
+            stoch_k_prev_valid = is_valid_number(stoch_k_prev) and 0 <= stoch_k_prev <= 100
+            stoch_d_prev_valid = is_valid_number(stoch_d_prev) and 0 <= stoch_d_prev <= 100
             
             stoch_bullish = False
             stoch_bearish = False
-            if stoch_k_prev is not None and stoch_d_prev is not None and stoch_k is not None and stoch_d is not None:
+            if stoch_k_prev_valid and stoch_d_prev_valid and stoch_k_valid and stoch_d_valid:
                 stoch_bullish = (stoch_k_prev < stoch_d_prev and stoch_k > stoch_d and 
                                 stoch_k < self.config.STOCH_OVERBOUGHT_LEVEL)
                 stoch_bearish = (stoch_k_prev > stoch_d_prev and stoch_k < stoch_d and 
                                 stoch_k > self.config.STOCH_OVERSOLD_LEVEL)
             
             volume_strong = True
-            if volume is not None and volume_avg is not None:
+            volume_valid = is_valid_number(volume)
+            volume_avg_valid = is_valid_number(volume_avg) and volume_avg > 0
+            if volume_valid and volume_avg_valid:
                 volume_strong = volume > volume_avg * self.config.VOLUME_THRESHOLD_MULTIPLIER
             
             if signal_source == 'auto':
@@ -565,63 +765,109 @@ class TradingStrategy:
                     logger.error(f"Error calculating trend strength: {e}")
                     trend_strength, trend_desc = 0.3, "MEDIUM ⚡"
                 
+                if not is_valid_number(trend_strength):
+                    logger.warning(f"NaN/Inf detected in trend_strength: {trend_strength}, using default 0.3")
+                    trend_strength = 0.3
+                    trend_desc = "MEDIUM ⚡"
+                
+                trend_strength = float(min(max(trend_strength, 0.0), 1.0))
+                
                 if signal_source == 'auto' and trend_strength < 0.3:
                     logger.info(f"Auto signal rejected - trend strength too weak: {trend_strength:.2f} ({trend_desc})")
                     return None
                 
                 try:
                     dynamic_tp_ratio = 1.45 + (trend_strength * 1.05)
-                    dynamic_tp_ratio = min(max(dynamic_tp_ratio, 1.45), 2.50)
+                    
+                    if not is_valid_number(dynamic_tp_ratio):
+                        logger.warning(f"NaN/Inf in dynamic_tp_ratio: {dynamic_tp_ratio}, using default 1.5")
+                        dynamic_tp_ratio = 1.5
+                    
+                    dynamic_tp_ratio = float(min(max(dynamic_tp_ratio, 1.45), 2.50))
                     
                     if not (1.0 <= dynamic_tp_ratio <= 3.0):
                         logger.warning(f"Invalid TP ratio: {dynamic_tp_ratio}, using default 1.5")
                         dynamic_tp_ratio = 1.5
                     
-                    atr = indicators.get('atr', 1.0)
-                    if atr <= 0:
+                    atr_raw = indicators.get('atr', 1.0)
+                    atr = safe_float(atr_raw, 1.0, "signal_atr")
+                    if atr <= 0 or not is_valid_number(atr):
                         logger.warning(f"Invalid ATR: {atr}, using default 1.0")
                         atr = 1.0
                     
                     if signal_source == 'auto':
-                        sl_distance = max(atr * self.config.SL_ATR_MULTIPLIER, self.config.DEFAULT_SL_PIPS / self.config.XAUUSD_PIP_VALUE)
+                        sl_atr_mult = safe_float(self.config.SL_ATR_MULTIPLIER, 1.5, "SL_ATR_MULTIPLIER")
+                        default_sl_pips = safe_float(self.config.DEFAULT_SL_PIPS, 10.0, "DEFAULT_SL_PIPS")
+                        pip_value = safe_float(self.config.XAUUSD_PIP_VALUE, 10.0, "XAUUSD_PIP_VALUE")
+                        
+                        if pip_value <= 0:
+                            logger.warning(f"Invalid pip value: {pip_value}, using default 10.0")
+                            pip_value = 10.0
+                        
+                        sl_distance = max(atr * sl_atr_mult, safe_divide(default_sl_pips, pip_value, 1.0, "sl_distance_calc"))
                     else:
                         sl_distance = max(atr * 1.2, 1.0)
                     
-                    if sl_distance <= 0 or sl_distance > 100:
+                    if not is_valid_number(sl_distance) or sl_distance <= 0 or sl_distance > 100:
                         logger.error(f"Invalid SL distance: {sl_distance}")
                         return None
                     
                     tp_distance = sl_distance * dynamic_tp_ratio
                     
-                    if close is None or close <= 0:
+                    if not is_valid_number(tp_distance) or tp_distance <= 0:
+                        logger.error(f"Invalid TP distance: {tp_distance}")
+                        return None
+                    
+                    close_val = safe_float(close, 0.0, "close_for_sl_tp")
+                    if close_val <= 0 or not is_valid_number(close_val):
                         logger.error(f"Invalid close price for SL/TP calculation: {close}")
                         return None
                     
                     if signal == 'BUY':
-                        stop_loss = close - sl_distance
-                        take_profit = close + tp_distance
+                        stop_loss = close_val - sl_distance
+                        take_profit = close_val + tp_distance
                     else:
-                        stop_loss = close + sl_distance
-                        take_profit = close - tp_distance
+                        stop_loss = close_val + sl_distance
+                        take_profit = close_val - tp_distance
+                    
+                    if not is_valid_number(stop_loss) or not is_valid_number(take_profit):
+                        logger.error(f"NaN/Inf in SL/TP: SL={stop_loss}, TP={take_profit}")
+                        return None
                     
                     if stop_loss <= 0 or take_profit <= 0:
                         logger.error(f"Invalid SL/TP calculated: SL={stop_loss}, TP={take_profit}")
                         return None
                     
-                    sl_pips = abs(stop_loss - close) * self.config.XAUUSD_PIP_VALUE
-                    tp_pips = abs(take_profit - close) * self.config.XAUUSD_PIP_VALUE
+                    pip_value = safe_float(self.config.XAUUSD_PIP_VALUE, 10.0, "XAUUSD_PIP_VALUE")
+                    sl_pips = abs(stop_loss - close_val) * pip_value
+                    tp_pips = abs(take_profit - close_val) * pip_value
                     
-                    if sl_pips <= 0:
+                    if not is_valid_number(sl_pips) or sl_pips <= 0:
                         logger.error(f"Invalid SL pips: {sl_pips}")
                         return None
                     
-                    lot_size = self.config.FIXED_RISK_AMOUNT / sl_pips if sl_pips > 0 else self.config.LOT_SIZE
-                    lot_size = max(0.01, min(lot_size, 1.0))
+                    if not is_valid_number(tp_pips) or tp_pips <= 0:
+                        logger.error(f"Invalid TP pips: {tp_pips}")
+                        return None
                     
-                    expected_loss = self.config.FIXED_RISK_AMOUNT
+                    fixed_risk = safe_float(self.config.FIXED_RISK_AMOUNT, 10.0, "FIXED_RISK_AMOUNT")
+                    default_lot = safe_float(self.config.LOT_SIZE, 0.01, "LOT_SIZE")
+                    
+                    lot_size = safe_divide(fixed_risk, sl_pips, default_lot, "lot_size_calc")
+                    lot_size = float(max(0.01, min(lot_size, 1.0)))
+                    
+                    if not is_valid_number(lot_size):
+                        logger.warning(f"Invalid lot size calculated: {lot_size}, using default")
+                        lot_size = default_lot
+                    
+                    expected_loss = fixed_risk
                     expected_profit = expected_loss * dynamic_tp_ratio
                     
-                except (ValueError, ZeroDivisionError, OverflowError) as e:
+                    if not is_valid_number(expected_profit):
+                        logger.warning(f"Invalid expected_profit: {expected_profit}")
+                        expected_profit = expected_loss * 1.5
+                    
+                except (ValueError, ZeroDivisionError, OverflowError, TypeError) as e:
                     logger.error(f"Calculation error in signal generation: {type(e).__name__}: {e}")
                     return None
                 
@@ -630,38 +876,56 @@ class TradingStrategy:
                 logger.info(f"Dynamic TP Ratio: {dynamic_tp_ratio:.2f}x (Expected profit: ${expected_profit:.2f})")
                 logger.info(f"Risk: ${expected_loss:.2f} | Reward: ${expected_profit:.2f} | R:R = 1:{dynamic_tp_ratio:.2f}")
                 
-                if close is None:
-                    logger.error("Close price is None, cannot create signal")
-                    return None
+                def safe_indicator_float(val, default=None):
+                    """Convert indicator value to float safely for JSON serialization"""
+                    if val is None:
+                        return default
+                    if not is_valid_number(val):
+                        return default
+                    try:
+                        return float(val)
+                    except (ValueError, TypeError):
+                        return default
+                
+                def safe_indicator_int(val, default=None):
+                    """Convert indicator value to int safely for JSON serialization"""
+                    if val is None:
+                        return default
+                    if not is_valid_number(val):
+                        return default
+                    try:
+                        return int(val)
+                    except (ValueError, TypeError):
+                        return default
                 
                 return {
                     'signal': signal,
                     'signal_source': signal_source,
-                    'entry_price': float(close),
+                    'entry_price': float(close_val),
                     'stop_loss': float(stop_loss),
                     'take_profit': float(take_profit),
                     'timeframe': timeframe,
-                    'trend_strength': trend_strength,
+                    'trend_strength': float(trend_strength),
                     'trend_description': trend_desc,
-                    'expected_profit': expected_profit,
-                    'expected_loss': expected_loss,
-                    'rr_ratio': dynamic_tp_ratio,
-                    'lot_size': lot_size,
-                    'sl_pips': sl_pips,
-                    'tp_pips': tp_pips,
+                    'expected_profit': float(expected_profit),
+                    'expected_loss': float(expected_loss),
+                    'rr_ratio': float(dynamic_tp_ratio),
+                    'lot_size': float(lot_size),
+                    'sl_pips': float(sl_pips),
+                    'tp_pips': float(tp_pips),
                     'indicators': json.dumps({
-                        'ema_short': float(ema_short) if ema_short is not None else None,
-                        'ema_mid': float(ema_mid) if ema_mid is not None else None,
-                        'ema_long': float(ema_long) if ema_long is not None else None,
-                        'rsi': float(rsi) if rsi is not None else None,
-                        'macd': float(macd) if macd is not None else None,
-                        'macd_signal': float(macd_signal) if macd_signal is not None else None,
-                        'macd_histogram': float(macd_histogram) if macd_histogram is not None else None,
-                        'stoch_k': float(stoch_k) if stoch_k is not None else None,
-                        'stoch_d': float(stoch_d) if stoch_d is not None else None,
-                        'atr': float(atr) if atr is not None else None,
-                        'volume': int(volume) if volume is not None else None,
-                        'volume_avg': float(volume_avg) if volume_avg is not None else None
+                        'ema_short': safe_indicator_float(ema_short),
+                        'ema_mid': safe_indicator_float(ema_mid),
+                        'ema_long': safe_indicator_float(ema_long),
+                        'rsi': safe_indicator_float(rsi),
+                        'macd': safe_indicator_float(macd),
+                        'macd_signal': safe_indicator_float(macd_signal),
+                        'macd_histogram': safe_indicator_float(macd_histogram),
+                        'stoch_k': safe_indicator_float(stoch_k),
+                        'stoch_d': safe_indicator_float(stoch_d),
+                        'atr': safe_indicator_float(atr),
+                        'volume': safe_indicator_int(volume),
+                        'volume_avg': safe_indicator_float(volume_avg)
                     }),
                     'confidence_reasons': confidence_reasons
                 }
@@ -683,10 +947,24 @@ class TradingStrategy:
             if missing:
                 return False, f"Missing required fields: {missing}"
             
-            entry = signal['entry_price']
-            sl = signal['stop_loss']
-            tp = signal['take_profit']
+            entry_raw = signal['entry_price']
+            sl_raw = signal['stop_loss']
+            tp_raw = signal['take_profit']
             signal_type = signal['signal']
+            
+            if not is_valid_number(entry_raw):
+                logger.warning(f"NaN/Inf detected in entry_price: {entry_raw}")
+                return False, f"Entry price is NaN or Inf: {entry_raw}"
+            if not is_valid_number(sl_raw):
+                logger.warning(f"NaN/Inf detected in stop_loss: {sl_raw}")
+                return False, f"Stop loss is NaN or Inf: {sl_raw}"
+            if not is_valid_number(tp_raw):
+                logger.warning(f"NaN/Inf detected in take_profit: {tp_raw}")
+                return False, f"Take profit is NaN or Inf: {tp_raw}"
+            
+            entry = safe_float(entry_raw, 0.0)
+            sl = safe_float(sl_raw, 0.0)
+            tp = safe_float(tp_raw, 0.0)
             
             if entry <= 0 or sl <= 0 or tp <= 0:
                 return False, f"Invalid prices: entry={entry}, sl={sl}, tp={tp}"
@@ -695,19 +973,42 @@ class TradingStrategy:
                 return False, f"Invalid signal type: {signal_type}"
             
             try:
-                spread_pips = current_spread * self.config.XAUUSD_PIP_VALUE
+                spread_safe = safe_float(current_spread, 0.0, "current_spread")
+                pip_value = safe_float(self.config.XAUUSD_PIP_VALUE, 10.0, "XAUUSD_PIP_VALUE")
+                
+                if pip_value <= 0:
+                    pip_value = 10.0
+                
+                spread_pips = spread_safe * pip_value
+                
+                if not is_valid_number(spread_pips):
+                    logger.warning(f"NaN/Inf in spread calculation: {spread_pips}, using 0")
+                    spread_pips = 0.0
                 
                 if spread_pips < 0:
                     logger.warning(f"Negative spread: {spread_pips}, using 0")
-                    spread_pips = 0
+                    spread_pips = 0.0
                 
-                if spread_pips > self.config.MAX_SPREAD_PIPS:
-                    return False, f"Spread too high: {spread_pips:.2f} pips (max: {self.config.MAX_SPREAD_PIPS})"
+                max_spread = safe_float(self.config.MAX_SPREAD_PIPS, 50.0, "MAX_SPREAD_PIPS")
+                if spread_pips > max_spread:
+                    return False, f"Spread too high: {spread_pips:.2f} pips (max: {max_spread})"
             except Exception as e:
                 logger.warning(f"Error calculating spread pips: {e}")
             
-            sl_pips = abs(entry - sl) * self.config.XAUUSD_PIP_VALUE
-            tp_pips = abs(entry - tp) * self.config.XAUUSD_PIP_VALUE
+            pip_value = safe_float(self.config.XAUUSD_PIP_VALUE, 10.0, "XAUUSD_PIP_VALUE_validate")
+            if pip_value <= 0:
+                pip_value = 10.0
+            
+            sl_pips = abs(entry - sl) * pip_value
+            tp_pips = abs(entry - tp) * pip_value
+            
+            if not is_valid_number(sl_pips):
+                logger.warning(f"NaN/Inf in SL pips validation: {sl_pips}")
+                return False, f"SL pips calculation resulted in NaN/Inf: {sl_pips}"
+            
+            if not is_valid_number(tp_pips):
+                logger.warning(f"NaN/Inf in TP pips validation: {tp_pips}")
+                return False, f"TP pips calculation resulted in NaN/Inf: {tp_pips}"
             
             if sl_pips < 5:
                 return False, f"Stop loss too tight: {sl_pips:.1f} pips (min: 5 pips)"

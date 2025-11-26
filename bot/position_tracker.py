@@ -1,6 +1,6 @@
 import asyncio
 from datetime import datetime
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, Set
 import pytz
 from telegram.error import TimedOut
 from bot.logger import setup_logger
@@ -8,6 +8,11 @@ from bot.database import Position, Trade
 from bot.signal_session_manager import SignalSessionManager
 
 logger = setup_logger('PositionTracker')
+
+DEFAULT_OPERATION_TIMEOUT = 30.0
+NOTIFICATION_TIMEOUT = 10.0
+FALLBACK_NOTIFICATION_TIMEOUT = 5.0
+TICK_QUEUE_TIMEOUT = 5.0
 
 class PositionError(Exception):
     """Base exception for position tracking errors"""
@@ -80,6 +85,40 @@ class PositionTracker:
         self.signal_session_manager = signal_session_manager
         self.active_positions = {}
         self.monitoring = False
+        
+        self._position_lock = asyncio.Lock()
+        self._pending_tasks: Set[asyncio.Task] = set()
+        self._shutdown_event = asyncio.Event()
+    
+    def _create_tracked_task(self, coro, name: str = None) -> asyncio.Task:
+        """Create a task and track it for proper cleanup on shutdown"""
+        task = asyncio.create_task(coro, name=name)
+        self._pending_tasks.add(task)
+        task.add_done_callback(self._pending_tasks.discard)
+        return task
+    
+    async def _cancel_pending_tasks(self):
+        """Cancel all pending tasks with proper cleanup"""
+        if not self._pending_tasks:
+            return
+        
+        logger.info(f"Cancelling {len(self._pending_tasks)} pending tasks...")
+        
+        tasks_to_cancel = list(self._pending_tasks)
+        for task in tasks_to_cancel:
+            if not task.done():
+                task.cancel()
+        
+        if tasks_to_cancel:
+            results = await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
+            for task, result in zip(tasks_to_cancel, results):
+                if isinstance(result, asyncio.CancelledError):
+                    logger.debug(f"Task {task.get_name()} cancelled successfully")
+                elif isinstance(result, Exception):
+                    logger.warning(f"Task {task.get_name()} raised exception during cancel: {result}")
+        
+        self._pending_tasks.clear()
+        logger.info("All pending tasks cancelled")
     
     def set_signal_session_manager(self, signal_session_manager: SignalSessionManager):
         """Set signal session manager for dependency injection"""
@@ -105,8 +144,7 @@ class PositionTracker:
                 
                 if self.alert_system:
                     try:
-                        import asyncio
-                        asyncio.create_task(
+                        self._create_tracked_task(
                             self.alert_system.send_system_error(
                                 f"⚠️ High Slippage Alert\n\n"
                                 f"Operation: {operation}\n"
@@ -116,7 +154,8 @@ class PositionTracker:
                                 f"Actual Price: ${actual_price:.2f}\n"
                                 f"Slippage: {slippage_pips:.1f} pips (>${self.MAX_SLIPPAGE_PIPS} pips threshold)\n\n"
                                 f"⚠️ Check market conditions and broker execution quality"
-                            )
+                            ),
+                            name=f"slippage_alert_{user_id}_{position_id}"
                         )
                     except Exception as e:
                         logger.error(f"Failed to send slippage alert: {e}")
@@ -140,7 +179,10 @@ class PositionTracker:
         
     async def add_position(self, user_id: int, trade_id: int, signal_type: str, entry_price: float,
                           stop_loss: float, take_profit: float):
-        """Add position with comprehensive validation and error handling"""
+        """Add position with comprehensive validation and error handling
+        
+        Thread-safe with asyncio.Lock for active_positions access
+        """
         is_valid, error_msg = validate_position_data(user_id, trade_id, signal_type, entry_price, stop_loss, take_profit)
         if not is_valid:
             logger.error(f"Position validation failed: {error_msg}")
@@ -148,6 +190,7 @@ class PositionTracker:
             return None
         
         session = self.db.get_session()
+        position_id = None
         try:
             position = Position(
                 user_id=user_id,
@@ -170,28 +213,35 @@ class PositionTracker:
             position_id = position.id
             session.commit()
             
-            if user_id not in self.active_positions:
-                self.active_positions[user_id] = {}
-            
-            self.active_positions[user_id][position_id] = {
-                'trade_id': trade_id,
-                'signal_type': signal_type,
-                'entry_price': entry_price,
-                'stop_loss': stop_loss,
-                'take_profit': take_profit,
-                'original_sl': stop_loss,
-                'sl_adjustment_count': 0,
-                'max_profit_reached': 0.0
-            }
+            async with self._position_lock:
+                if user_id not in self.active_positions:
+                    self.active_positions[user_id] = {}
+                
+                self.active_positions[user_id][position_id] = {
+                    'trade_id': trade_id,
+                    'signal_type': signal_type,
+                    'entry_price': entry_price,
+                    'stop_loss': stop_loss,
+                    'take_profit': take_profit,
+                    'original_sl': stop_loss,
+                    'sl_adjustment_count': 0,
+                    'max_profit_reached': 0.0
+                }
             
             logger.info(f"✅ Position added - User:{user_id} ID:{position_id} {signal_type} @${entry_price:.2f} SL:${stop_loss:.2f} TP:${take_profit:.2f}")
             
             if self.signal_session_manager:
-                await self.signal_session_manager.update_session(
-                    user_id,
-                    position_id=position_id,
-                    trade_id=trade_id
-                )
+                try:
+                    await asyncio.wait_for(
+                        self.signal_session_manager.update_session(
+                            user_id,
+                            position_id=position_id,
+                            trade_id=trade_id
+                        ),
+                        timeout=DEFAULT_OPERATION_TIMEOUT
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(f"Timeout updating signal session for position {position_id}")
             
             return position_id
             
@@ -208,16 +258,21 @@ class PositionTracker:
             except Exception as close_error:
                 logger.error(f"Error closing session: {close_error}")
     
-    async def apply_dynamic_sl(self, user_id: int, position_id: int, current_price: float, unrealized_pl: float) -> tuple[bool, Optional[float]]:
-        """Apply dynamic SL tightening when loss >= threshold
+    async def _apply_dynamic_sl_internal(self, user_id: int, position_id: int, pos: Dict, 
+                                          current_price: float, unrealized_pl: float) -> tuple[bool, Optional[float], Dict]:
+        """Internal method: Apply dynamic SL tightening when loss >= threshold
         
+        Args:
+            user_id: User ID
+            position_id: Position ID
+            pos: Position dict (will be modified in place)
+            current_price: Current market price
+            unrealized_pl: Unrealized P/L
+            
         Returns:
-            tuple[bool, Optional[float]]: (sl_adjusted, new_stop_loss)
+            tuple[bool, Optional[float], Dict]: (sl_adjusted, new_stop_loss, updated_pos)
         """
-        if user_id not in self.active_positions or position_id not in self.active_positions[user_id]:
-            return False, None
-        
-        pos = self._normalize_position_dict(self.active_positions[user_id][position_id])
+        pos = self._normalize_position_dict(pos)
         signal_type = pos['signal_type']
         entry_price = pos['entry_price']
         stop_loss = pos['stop_loss']
@@ -229,7 +284,7 @@ class PositionTracker:
             logger.warning(f"original_sl was None for position {position_id}, using current stop_loss")
         
         if unrealized_pl >= 0 or abs(unrealized_pl) < self.config.DYNAMIC_SL_LOSS_THRESHOLD:
-            return False, None
+            return False, None, pos
         
         original_sl_distance = abs(entry_price - original_sl)
         new_sl_distance = original_sl_distance * self.config.DYNAMIC_SL_TIGHTENING_MULTIPLIER
@@ -255,7 +310,12 @@ class PositionTracker:
                             f"SL Updated: ${stop_loss:.2f} → ${new_stop_loss:.2f}\n"
                             f"Protection: Capital preservation mode"
                         )
-                        await self.telegram_app.bot.send_message(chat_id=user_id, text=msg, parse_mode='Markdown')
+                        await asyncio.wait_for(
+                            self.telegram_app.bot.send_message(chat_id=user_id, text=msg, parse_mode='Markdown'),
+                            timeout=NOTIFICATION_TIMEOUT
+                        )
+                    except asyncio.TimeoutError:
+                        logger.error(f"Timeout sending dynamic SL notification to user {user_id}")
                     except Exception as e:
                         logger.error(f"Failed to send dynamic SL notification: {e}")
         else:
@@ -276,27 +336,62 @@ class PositionTracker:
                             f"SL Updated: ${stop_loss:.2f} → ${new_stop_loss:.2f}\n"
                             f"Protection: Capital preservation mode"
                         )
-                        await self.telegram_app.bot.send_message(chat_id=user_id, text=msg, parse_mode='Markdown')
+                        await asyncio.wait_for(
+                            self.telegram_app.bot.send_message(chat_id=user_id, text=msg, parse_mode='Markdown'),
+                            timeout=NOTIFICATION_TIMEOUT
+                        )
+                    except asyncio.TimeoutError:
+                        logger.error(f"Timeout sending dynamic SL notification to user {user_id}")
                     except Exception as e:
                         logger.error(f"Failed to send dynamic SL notification: {e}")
         
-        return sl_adjusted, new_stop_loss if sl_adjusted else None
+        return sl_adjusted, new_stop_loss if sl_adjusted else None, pos
     
-    async def apply_trailing_stop(self, user_id: int, position_id: int, current_price: float, unrealized_pl: float) -> tuple[bool, Optional[float]]:
-        """Apply trailing stop when profit >= threshold
+    async def apply_dynamic_sl(self, user_id: int, position_id: int, current_price: float, unrealized_pl: float) -> tuple[bool, Optional[float]]:
+        """Apply dynamic SL tightening when loss >= threshold
+        
+        Thread-safe wrapper for _apply_dynamic_sl_internal
         
         Returns:
             tuple[bool, Optional[float]]: (sl_adjusted, new_stop_loss)
         """
-        if user_id not in self.active_positions or position_id not in self.active_positions[user_id]:
-            return False, None
+        async with self._position_lock:
+            if user_id not in self.active_positions or position_id not in self.active_positions[user_id]:
+                return False, None
+            
+            pos = self.active_positions[user_id][position_id].copy()
         
-        pos = self._normalize_position_dict(self.active_positions[user_id][position_id])
+        sl_adjusted, new_sl, updated_pos = await self._apply_dynamic_sl_internal(
+            user_id, position_id, pos, current_price, unrealized_pl
+        )
+        
+        if sl_adjusted:
+            async with self._position_lock:
+                if user_id in self.active_positions and position_id in self.active_positions[user_id]:
+                    self.active_positions[user_id][position_id].update(updated_pos)
+        
+        return sl_adjusted, new_sl
+    
+    async def _apply_trailing_stop_internal(self, user_id: int, position_id: int, pos: Dict,
+                                             current_price: float, unrealized_pl: float) -> tuple[bool, Optional[float], Dict]:
+        """Internal method: Apply trailing stop when profit >= threshold
+        
+        Args:
+            user_id: User ID
+            position_id: Position ID
+            pos: Position dict (will be modified)
+            current_price: Current market price
+            unrealized_pl: Unrealized P/L
+            
+        Returns:
+            tuple[bool, Optional[float], Dict]: (sl_adjusted, new_stop_loss, updated_pos)
+        """
+        pos = self._normalize_position_dict(pos)
         signal_type = pos['signal_type']
         stop_loss = pos['stop_loss']
         
         if unrealized_pl <= 0 or unrealized_pl < self.config.TRAILING_STOP_PROFIT_THRESHOLD:
-            return False, None
+            return False, None, pos
         
         max_profit = pos.get('max_profit_reached', 0.0)
         if max_profit is None:
@@ -329,7 +424,12 @@ class PositionTracker:
                             f"SL Updated: ${stop_loss:.2f} → ${new_trailing_sl:.2f}\n"
                             f"Status: Profit locked-in!"
                         )
-                        await self.telegram_app.bot.send_message(chat_id=user_id, text=msg, parse_mode='Markdown')
+                        await asyncio.wait_for(
+                            self.telegram_app.bot.send_message(chat_id=user_id, text=msg, parse_mode='Markdown'),
+                            timeout=NOTIFICATION_TIMEOUT
+                        )
+                    except asyncio.TimeoutError:
+                        logger.error(f"Timeout sending trailing stop notification to user {user_id}")
                     except Exception as e:
                         logger.error(f"Failed to send trailing stop notification: {e}")
         else:
@@ -351,24 +451,58 @@ class PositionTracker:
                             f"SL Updated: ${stop_loss:.2f} → ${new_trailing_sl:.2f}\n"
                             f"Status: Profit locked-in!"
                         )
-                        await self.telegram_app.bot.send_message(chat_id=user_id, text=msg, parse_mode='Markdown')
+                        await asyncio.wait_for(
+                            self.telegram_app.bot.send_message(chat_id=user_id, text=msg, parse_mode='Markdown'),
+                            timeout=NOTIFICATION_TIMEOUT
+                        )
+                    except asyncio.TimeoutError:
+                        logger.error(f"Timeout sending trailing stop notification to user {user_id}")
                     except Exception as e:
                         logger.error(f"Failed to send trailing stop notification: {e}")
         
-        return sl_adjusted, new_trailing_sl if sl_adjusted else None
+        return sl_adjusted, new_trailing_sl if sl_adjusted else None, pos
+    
+    async def apply_trailing_stop(self, user_id: int, position_id: int, current_price: float, unrealized_pl: float) -> tuple[bool, Optional[float]]:
+        """Apply trailing stop when profit >= threshold
+        
+        Thread-safe wrapper for _apply_trailing_stop_internal
+        
+        Returns:
+            tuple[bool, Optional[float]]: (sl_adjusted, new_stop_loss)
+        """
+        async with self._position_lock:
+            if user_id not in self.active_positions or position_id not in self.active_positions[user_id]:
+                return False, None
+            
+            pos = self.active_positions[user_id][position_id].copy()
+        
+        sl_adjusted, new_sl, updated_pos = await self._apply_trailing_stop_internal(
+            user_id, position_id, pos, current_price, unrealized_pl
+        )
+        
+        if sl_adjusted:
+            async with self._position_lock:
+                if user_id in self.active_positions and position_id in self.active_positions[user_id]:
+                    self.active_positions[user_id][position_id].update(updated_pos)
+        
+        return sl_adjusted, new_sl
     
     async def update_position(self, user_id: int, position_id: int, current_price: float) -> Optional[str]:
-        """Update position with current price and apply dynamic SL/TP logic with validation"""
+        """Update position with current price and apply dynamic SL/TP logic with validation
+        
+        Thread-safe position update with lock protection
+        """
         try:
             if current_price is None or current_price <= 0:
                 logger.warning(f"Invalid current_price for position {position_id}: {current_price}")
                 return None
             
-            if user_id not in self.active_positions or position_id not in self.active_positions[user_id]:
-                logger.debug(f"Position {position_id} for User:{user_id} not found in active positions")
-                return None
-            
-            pos = self.active_positions[user_id][position_id]
+            async with self._position_lock:
+                if user_id not in self.active_positions or position_id not in self.active_positions[user_id]:
+                    logger.debug(f"Position {position_id} for User:{user_id} not found in active positions")
+                    return None
+                
+                pos = self.active_positions[user_id][position_id].copy()
             
             try:
                 signal_type = pos['signal_type']
@@ -406,7 +540,12 @@ class PositionTracker:
                 except Exception as e:
                     logger.error(f"Error applying trailing stop for position {position_id}: {e}")
             
-            stop_loss = pos['stop_loss']
+            async with self._position_lock:
+                if user_id in self.active_positions and position_id in self.active_positions[user_id]:
+                    stop_loss = self.active_positions[user_id][position_id]['stop_loss']
+                    sl_adjustment_count = self.active_positions[user_id][position_id].get('sl_adjustment_count', 0)
+                else:
+                    return None
             
             session = self.db.get_session()
             try:
@@ -425,7 +564,7 @@ class PositionTracker:
                 
                 if sl_adjusted:
                     position.stop_loss = stop_loss
-                    position.sl_adjustment_count = pos['sl_adjustment_count']
+                    position.sl_adjustment_count = sl_adjustment_count
                 
                 session.commit()
             except Exception as e:
@@ -469,10 +608,16 @@ class PositionTracker:
             return None
     
     async def close_position(self, user_id: int, position_id: int, exit_price: float, reason: str):
-        if user_id not in self.active_positions or position_id not in self.active_positions[user_id]:
-            return
+        """Close a position with thread-safe access and proper cleanup
         
-        pos = self.active_positions[user_id][position_id]
+        Thread-safe position closure with lock protection
+        """
+        async with self._position_lock:
+            if user_id not in self.active_positions or position_id not in self.active_positions[user_id]:
+                return
+            
+            pos = self.active_positions[user_id][position_id].copy()
+        
         trade_id = pos['trade_id']
         signal_type = pos['signal_type']
         entry_price = pos['entry_price']
@@ -501,9 +646,11 @@ class PositionTracker:
                 
             session.commit()
             
-            del self.active_positions[user_id][position_id]
-            if not self.active_positions[user_id]:
-                del self.active_positions[user_id]
+            async with self._position_lock:
+                if user_id in self.active_positions and position_id in self.active_positions[user_id]:
+                    del self.active_positions[user_id][position_id]
+                    if not self.active_positions[user_id]:
+                        del self.active_positions[user_id]
             
             logger.info(f"Position closed - User:{user_id} ID:{position_id} {reason} P/L:${actual_pl:.2f}")
             
@@ -632,9 +779,18 @@ class PositionTracker:
         
         This method is called by the scheduler every 10 seconds.
         Returns a list of updated positions.
+        Thread-safe with lock protection for reading active_positions
         """
-        if not self.active_positions:
+        if self._shutdown_event.is_set():
             return []
+        
+        async with self._position_lock:
+            if not self.active_positions:
+                return []
+            positions_snapshot = {
+                user_id: list(positions.keys()) 
+                for user_id, positions in self.active_positions.items()
+            }
         
         if not self.market_data:
             logger.warning("Market data not available for position monitoring")
@@ -643,16 +799,26 @@ class PositionTracker:
         updated_positions = []
         
         try:
-            current_price = await self.market_data.get_current_price()
+            current_price = await asyncio.wait_for(
+                self.market_data.get_current_price(),
+                timeout=DEFAULT_OPERATION_TIMEOUT
+            )
             
             if not current_price:
                 logger.warning("No current price available for position monitoring")
                 return []
             
-            for user_id in list(self.active_positions.keys()):
-                for position_id in list(self.active_positions[user_id].keys()):
+            for user_id, position_ids in positions_snapshot.items():
+                for position_id in position_ids:
+                    if self._shutdown_event.is_set():
+                        logger.info("Shutdown requested, stopping position monitoring")
+                        return updated_positions
+                    
                     try:
-                        result = await self.update_position(user_id, position_id, current_price)
+                        result = await asyncio.wait_for(
+                            self.update_position(user_id, position_id, current_price),
+                            timeout=DEFAULT_OPERATION_TIMEOUT
+                        )
                         if result:
                             updated_positions.append({
                                 'user_id': user_id,
@@ -661,58 +827,154 @@ class PositionTracker:
                                 'price': current_price
                             })
                             logger.info(f"Position {position_id} User:{user_id} closed: {result} at ${current_price:.2f}")
+                    except asyncio.TimeoutError:
+                        logger.error(f"Timeout updating position {position_id} for user {user_id}")
                     except Exception as e:
                         logger.error(f"Error monitoring position {position_id} for user {user_id}: {e}")
             
             return updated_positions
             
+        except asyncio.TimeoutError:
+            logger.error("Timeout getting current price for position monitoring")
+            return []
         except Exception as e:
             logger.error(f"Error in monitor_active_positions: {e}")
             return []
     
     async def monitor_positions(self, market_data_client):
+        """Monitor positions with tick data stream
+        
+        Uses timeout on tick_queue.get() to allow graceful shutdown checking
+        """
         tick_queue = await market_data_client.subscribe_ticks('position_tracker')
         logger.info("Position tracker monitoring started")
         
         self.monitoring = True
+        self._shutdown_event.clear()
         
         try:
-            while self.monitoring:
+            while self.monitoring and not self._shutdown_event.is_set():
                 try:
-                    tick = await tick_queue.get()
+                    try:
+                        tick = await asyncio.wait_for(
+                            tick_queue.get(),
+                            timeout=TICK_QUEUE_TIMEOUT
+                        )
+                    except asyncio.TimeoutError:
+                        continue
                     
-                    if self.active_positions:
-                        mid_price = tick['quote']
-                        
-                        for user_id in list(self.active_positions.keys()):
-                            for position_id in list(self.active_positions[user_id].keys()):
-                                result = await self.update_position(user_id, position_id, mid_price)
+                    async with self._position_lock:
+                        if not self.active_positions:
+                            continue
+                        positions_snapshot = {
+                            user_id: list(positions.keys()) 
+                            for user_id, positions in self.active_positions.items()
+                        }
+                    
+                    mid_price = tick['quote']
+                    
+                    for user_id, position_ids in positions_snapshot.items():
+                        if not self.monitoring or self._shutdown_event.is_set():
+                            break
+                        for position_id in position_ids:
+                            if not self.monitoring or self._shutdown_event.is_set():
+                                break
+                            try:
+                                result = await asyncio.wait_for(
+                                    self.update_position(user_id, position_id, mid_price),
+                                    timeout=DEFAULT_OPERATION_TIMEOUT
+                                )
                                 if result:
                                     logger.info(f"Position {position_id} User:{user_id} closed: {result}")
+                            except asyncio.TimeoutError:
+                                logger.error(f"Timeout updating position {position_id}")
+                            except Exception as e:
+                                logger.error(f"Error updating position {position_id}: {e}")
                     
+                except asyncio.CancelledError:
+                    logger.info("Position monitoring cancelled")
+                    break
                 except Exception as e:
                     logger.error(f"Error processing tick dalam position monitoring: {e}")
-                    await asyncio.sleep(1)
+                    if self.monitoring and not self._shutdown_event.is_set():
+                        await asyncio.sleep(1)
                     
         finally:
-            await market_data_client.unsubscribe_ticks('position_tracker')
+            try:
+                await market_data_client.unsubscribe_ticks('position_tracker')
+            except Exception as e:
+                logger.error(f"Error unsubscribing from ticks: {e}")
             logger.info("Position tracker monitoring stopped")
     
     def stop_monitoring(self):
+        """Stop the monitoring loop"""
         self.monitoring = False
-        logger.info("Position monitoring stopped")
+        self._shutdown_event.set()
+        logger.info("Position monitoring stop requested")
+    
+    async def shutdown(self):
+        """Graceful shutdown with proper resource cleanup
+        
+        Cancels all pending tasks and stops monitoring loop
+        """
+        logger.info("PositionTracker shutdown initiated...")
+        
+        self.monitoring = False
+        self._shutdown_event.set()
+        
+        await self._cancel_pending_tasks()
+        
+        async with self._position_lock:
+            active_count = sum(len(positions) for positions in self.active_positions.values())
+            if active_count > 0:
+                logger.warning(f"Shutting down with {active_count} active positions")
+        
+        logger.info("PositionTracker shutdown complete")
+    
+    async def get_active_positions_async(self, user_id: Optional[int] = None) -> Dict:
+        """Thread-safe getter for active positions (async version)"""
+        async with self._position_lock:
+            if user_id is not None:
+                return self.active_positions.get(user_id, {}).copy()
+            return {uid: pos.copy() for uid, pos in self.active_positions.items()}
     
     def get_active_positions(self, user_id: Optional[int] = None) -> Dict:
+        """Get active positions (sync version, returns snapshot)
+        
+        Note: For thread-safe access in async context, use get_active_positions_async
+        """
         if user_id is not None:
             return self.active_positions.get(user_id, {}).copy()
-        return self.active_positions.copy()
+        return {uid: pos.copy() for uid, pos in self.active_positions.items()}
+    
+    async def has_active_position_async(self, user_id: int) -> bool:
+        """Thread-safe check for active position (async version)"""
+        if self.signal_session_manager:
+            return self.signal_session_manager.has_active_session(user_id)
+        async with self._position_lock:
+            return user_id in self.active_positions and len(self.active_positions[user_id]) > 0
     
     def has_active_position(self, user_id: int) -> bool:
+        """Check if user has active position (sync version)
+        
+        Note: For thread-safe access in async context, use has_active_position_async
+        """
         if self.signal_session_manager:
             return self.signal_session_manager.has_active_session(user_id)
         return user_id in self.active_positions and len(self.active_positions[user_id]) > 0
     
+    async def get_active_position_count_async(self, user_id: Optional[int] = None) -> int:
+        """Thread-safe getter for active position count (async version)"""
+        async with self._position_lock:
+            if user_id is not None:
+                return len(self.active_positions.get(user_id, {}))
+            return sum(len(positions) for positions in self.active_positions.values())
+    
     def get_active_position_count(self, user_id: Optional[int] = None) -> int:
+        """Get active position count (sync version)
+        
+        Note: For thread-safe access in async context, use get_active_position_count_async
+        """
         if user_id is not None:
             return len(self.active_positions.get(user_id, {}))
         return sum(len(positions) for positions in self.active_positions.values())

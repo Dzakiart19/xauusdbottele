@@ -142,6 +142,10 @@ class SystemMonitor:
 class TrackingMetrics:
     """Track signal generation rate, execution time, and performance metrics"""
     
+    MAX_OPERATION_TYPES = 50
+    MAX_TIMES_PER_OPERATION = 100
+    CLEANUP_INTERVAL_SECONDS = 300
+    
     def __init__(self, window_size: int = 100):
         self.window_size = window_size
         
@@ -153,7 +157,8 @@ class TrackingMetrics:
         self.signal_rejected_count = 0
         
         self.operation_counts = defaultdict(int)
-        self.operation_times = defaultdict(list)
+        self.operation_times: Dict[str, deque] = {}
+        self._last_cleanup = datetime.now(pytz.UTC)
         
         logger.info(f"TrackingMetrics initialized with window size {window_size}")
     
@@ -184,12 +189,63 @@ class TrackingMetrics:
             execution_time: Time in seconds
         """
         try:
+            self._maybe_cleanup()
+            
             self.execution_times[operation].append(execution_time)
             self.operation_counts[operation] += 1
+            
+            if operation not in self.operation_times:
+                if len(self.operation_times) >= self.MAX_OPERATION_TYPES:
+                    oldest_key = next(iter(self.operation_times))
+                    del self.operation_times[oldest_key]
+                    logger.debug(f"Removed oldest operation type: {oldest_key}")
+                self.operation_times[operation] = deque(maxlen=self.MAX_TIMES_PER_OPERATION)
+            
+            self.operation_times[operation].append(execution_time)
             
             logger.debug(f"Execution time recorded: {operation} = {execution_time:.3f}s")
         except Exception as e:
             logger.error(f"Error recording execution time: {e}")
+    
+    def _maybe_cleanup(self):
+        """Cleanup old data if interval has passed"""
+        try:
+            now = datetime.now(pytz.UTC)
+            if (now - self._last_cleanup).total_seconds() >= self.CLEANUP_INTERVAL_SECONDS:
+                self._cleanup_old_data()
+                self._last_cleanup = now
+        except Exception as e:
+            logger.error(f"Error in cleanup check: {e}")
+    
+    def _cleanup_old_data(self):
+        """Cleanup stale operation data to prevent memory leaks"""
+        try:
+            initial_op_count = len(self.operation_counts)
+            initial_times_count = len(self.operation_times)
+            
+            if len(self.operation_counts) > self.MAX_OPERATION_TYPES:
+                sorted_ops = sorted(self.operation_counts.items(), key=lambda x: x[1], reverse=True)
+                self.operation_counts = defaultdict(int, dict(sorted_ops[:self.MAX_OPERATION_TYPES]))
+            
+            op_count_cleaned = initial_op_count - len(self.operation_counts)
+            times_cleaned = initial_times_count - len(self.operation_times)
+            
+            if op_count_cleaned > 0 or times_cleaned > 0:
+                logger.info(f"TrackingMetrics cleanup: removed {op_count_cleaned} op_counts, {times_cleaned} op_times entries")
+        except Exception as e:
+            logger.error(f"Error cleaning up old data: {e}")
+    
+    def reset_counters(self):
+        """Reset all counters to prevent long-term overflow"""
+        try:
+            self.signal_count = 0
+            self.signal_accepted_count = 0
+            self.signal_rejected_count = 0
+            self.operation_counts.clear()
+            self.operation_times.clear()
+            logger.info("TrackingMetrics counters reset")
+        except Exception as e:
+            logger.error(f"Error resetting counters: {e}")
     
     def get_signal_rate(self, minutes: int = 60) -> Dict[str, Any]:
         """Get signal generation rate over specified time window
@@ -253,6 +309,14 @@ class TrackingMetrics:
                     }
                 
                 times = list(self.execution_times[operation])
+                if not times:
+                    return {
+                        'operation': operation,
+                        'count': 0,
+                        'avg_time': 0.0,
+                        'min_time': 0.0,
+                        'max_time': 0.0
+                    }
                 return {
                     'operation': operation,
                     'count': len(times),
@@ -263,18 +327,33 @@ class TrackingMetrics:
                 }
             else:
                 stats = {}
-                for op_name, times_deque in self.execution_times.items():
+                for op_name, times_deque in list(self.execution_times.items())[:self.MAX_OPERATION_TYPES]:
                     if times_deque:
                         times = list(times_deque)
-                        stats[op_name] = {
-                            'count': len(times),
-                            'avg_time': round(sum(times) / len(times), 3),
-                            'min_time': round(min(times), 3),
-                            'max_time': round(max(times), 3)
-                        }
+                        if times:
+                            stats[op_name] = {
+                                'count': len(times),
+                                'avg_time': round(sum(times) / len(times), 3),
+                                'min_time': round(min(times), 3),
+                                'max_time': round(max(times), 3)
+                            }
                 return stats
         except Exception as e:
             logger.error(f"Error getting execution stats: {e}")
+            return {'error': str(e)}
+    
+    def get_memory_stats(self) -> Dict[str, Any]:
+        """Get memory usage statistics for this tracker"""
+        try:
+            return {
+                'signal_times_size': len(self.signal_times),
+                'execution_times_operations': len(self.execution_times),
+                'operation_counts_size': len(self.operation_counts),
+                'operation_times_size': len(self.operation_times),
+                'total_operations': sum(self.operation_counts.values())
+            }
+        except Exception as e:
+            logger.error(f"Error getting memory stats: {e}")
             return {'error': str(e)}
     
     def get_performance_summary(self) -> Dict[str, Any]:
