@@ -79,11 +79,6 @@ class UserManager:
                 is_admin=is_admin
             )
             
-            if not is_admin:
-                user.subscription_tier = 'TRIAL'
-                user.subscription_expires = datetime.utcnow() + timedelta(days=3)
-                logger.info(f"User {telegram_id} assigned 3-day trial (expires: {user.subscription_expires})")
-            
             session.add(user)
             session.commit()
             
@@ -107,14 +102,6 @@ class UserManager:
         
         try:
             user = session.query(User).filter(User.telegram_id == telegram_id).first()
-            
-            if user:
-                if user.subscription_tier in ['TRIAL', 'WEEKLY', 'MONTHLY', 'PREMIUM']:
-                    if user.subscription_expires and user.subscription_expires <= datetime.utcnow():
-                        user.subscription_tier = 'FREE'
-                        user.subscription_expires = None
-                        session.commit()
-                        logger.info(f"User {telegram_id} subscription expired, downgraded to FREE")
             
             if user:
                 session.expunge(user)
@@ -149,10 +136,13 @@ class UserManager:
             session.close()
     
     def is_authorized(self, telegram_id: int) -> bool:
-        if not self.config.AUTHORIZED_USER_IDS:
+        if telegram_id in self.config.AUTHORIZED_USER_IDS:
             return True
         
-        return telegram_id in self.config.AUTHORIZED_USER_IDS
+        if hasattr(self.config, 'ID_USER_PUBLIC') and telegram_id in self.config.ID_USER_PUBLIC:
+            return True
+        
+        return False
     
     def is_admin(self, telegram_id: int) -> bool:
         user = self.get_user(telegram_id)
@@ -292,8 +282,7 @@ class UserManager:
             'created_at': created.strftime('%Y-%m-%d %H:%M'),
             'last_active': last_active.strftime('%Y-%m-%d %H:%M'),
             'total_trades': user.total_trades,
-            'total_profit': user.total_profit,
-            'subscription_tier': user.subscription_tier
+            'total_profit': user.total_profit
         }
         
         if prefs:
@@ -343,182 +332,11 @@ class UserManager:
         finally:
             session.close()
     
-    def is_premium(self, telegram_id: int) -> bool:
-        session = self.get_session()
-        
-        try:
-            user = session.query(User).filter(User.telegram_id == telegram_id).first()
-            
-            if not user:
-                return False
-            
-            if user.is_admin:
-                return True
-            
-            if user.subscription_tier in ['TRIAL', 'PREMIUM', 'WEEKLY', 'MONTHLY']:
-                if user.subscription_expires:
-                    if user.subscription_expires > datetime.utcnow():
-                        return True
-                    else:
-                        user.subscription_tier = 'FREE'
-                        user.subscription_expires = None
-                        session.commit()
-                        logger.info(f"Auto-downgraded expired user {telegram_id} to FREE")
-                        return False
-            
-            return False
-        finally:
-            session.close()
-    
-    def upgrade_subscription(self, telegram_id: int, duration: str) -> bool:
-        session = self.get_session()
-        
-        try:
-            user = session.query(User).filter(User.telegram_id == telegram_id).first()
-            
-            if not user:
-                logger.error(f"User not found: {telegram_id}")
-                return False
-            
-            from datetime import timedelta
-            
-            if duration == '1week':
-                days = 7
-                tier = 'WEEKLY'
-            elif duration == '1month':
-                days = 30
-                tier = 'MONTHLY'
-            else:
-                logger.error(f"Invalid duration: {duration}")
-                return False
-            
-            now = datetime.utcnow()
-            
-            if user.subscription_expires and user.subscription_expires > now:
-                new_expiry = user.subscription_expires + timedelta(days=days)
-            else:
-                new_expiry = now + timedelta(days=days)
-            
-            user.subscription_tier = tier
-            user.subscription_expires = new_expiry
-            session.commit()
-            
-            logger.info(f"Upgraded user {telegram_id} to {tier} until {new_expiry}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error upgrading subscription: {e}")
-            session.rollback()
-            return False
-        finally:
-            session.close()
-    
-    def get_subscription_status(self, telegram_id: int) -> Dict:
-        session = self.get_session()
-        
-        try:
-            user = session.query(User).filter(User.telegram_id == telegram_id).first()
-            
-            if not user:
-                return None
-            
-            if user.is_admin or telegram_id in self.config.AUTHORIZED_USER_IDS:
-                return {
-                    'tier': 'ADMIN',
-                    'status': 'Unlimited',
-                    'expires': None,
-                    'days_left': None
-                }
-            
-            if user.subscription_tier in ['TRIAL', 'WEEKLY', 'MONTHLY', 'PREMIUM']:
-                if user.subscription_expires:
-                    now = datetime.utcnow()
-                    if user.subscription_expires > now:
-                        days_left = (user.subscription_expires - now).days
-                        jakarta_tz = pytz.timezone('Asia/Jakarta')
-                        expires_local = user.subscription_expires.replace(tzinfo=pytz.UTC).astimezone(jakarta_tz)
-                        
-                        tier_label = 'TRIAL (3 Hari Gratis)' if user.subscription_tier == 'TRIAL' else user.subscription_tier
-                        
-                        return {
-                            'tier': tier_label,
-                            'status': 'Aktif',
-                            'expires': expires_local.strftime('%d/%m/%Y %H:%M'),
-                            'days_left': days_left
-                        }
-                    else:
-                        user.subscription_tier = 'FREE'
-                        user.subscription_expires = None
-                        session.commit()
-                        logger.info(f"Auto-downgraded expired user {telegram_id} to FREE in get_subscription_status")
-                        
-                        return {
-                            'tier': 'FREE',
-                            'status': 'Expired',
-                            'expires': None,
-                            'days_left': 0
-                        }
-            
-            return {
-                'tier': 'FREE',
-                'status': 'Tidak Aktif',
-                'expires': None,
-                'days_left': None
-            }
-        finally:
-            session.close()
-    
-    def extend_subscription(self, telegram_id: int, days: int) -> bool:
-        session = self.get_session()
-        
-        try:
-            user = session.query(User).filter(User.telegram_id == telegram_id).first()
-            
-            if not user:
-                return False
-            
-            from datetime import timedelta
-            now = datetime.utcnow()
-            
-            if user.subscription_expires and user.subscription_expires > now:
-                user.subscription_expires += timedelta(days=days)
-            else:
-                user.subscription_expires = now + timedelta(days=days)
-            
-            session.commit()
-            logger.info(f"Extended subscription for {telegram_id} by {days} days")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error extending subscription: {e}")
-            session.rollback()
-            return False
-        finally:
-            session.close()
-    
     def has_access(self, telegram_id: int) -> bool:
-        session = self.get_session()
+        if telegram_id in self.config.AUTHORIZED_USER_IDS:
+            return True
         
-        try:
-            user = session.query(User).filter(User.telegram_id == telegram_id).first()
-            
-            if not user:
-                return False
-            
-            if user.is_admin or telegram_id in self.config.AUTHORIZED_USER_IDS:
-                return True
-            
-            if user.subscription_tier in ['TRIAL', 'PREMIUM', 'WEEKLY', 'MONTHLY']:
-                if user.subscription_expires:
-                    if user.subscription_expires > datetime.utcnow():
-                        return True
-                    else:
-                        user.subscription_tier = 'FREE'
-                        user.subscription_expires = None
-                        session.commit()
-                        logger.info(f"Auto-downgraded expired user {telegram_id} to FREE in has_access")
-                        return False
-            
-            return False
-        finally:
-            session.close()
+        if hasattr(self.config, 'ID_USER_PUBLIC') and telegram_id in self.config.ID_USER_PUBLIC:
+            return True
+        
+        return False

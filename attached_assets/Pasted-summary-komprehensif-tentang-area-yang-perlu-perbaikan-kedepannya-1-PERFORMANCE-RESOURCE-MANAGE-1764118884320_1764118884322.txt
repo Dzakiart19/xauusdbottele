@@ -1,0 +1,35 @@
+summary komprehensif tentang area yang perlu perbaikan kedepannya:
+
+1. PERFORMANCE & RESOURCE MANAGEMENT ⚠️
+Market Data (1061 lines): Candle builders menggunakan deque(maxlen=500) - perlu monitoring memory jika signal frequency tinggi
+Position Tracker (719 lines): Monitoring loop menggunakan asyncio.sleep(2) secara global - bisa dioptimalkan dengan event-based notification
+Chart Generator: MAX_WORKERS=1 di FREE_TIER_MODE - akan bottleneck jika multi-user trading aktif
+2. ERROR HANDLING & EDGE CASES 🔴
+Telegram Bot (2270 lines): Signal send failure rollback sudah ada, tapi tidak ada retry mechanism untuk failed sends
+Position Tracker: Slippage detection ada tapi tidak ada automatic recovery untuk high-slippage situations
+Database: Perlu circuit breaker untuk database connection timeouts (baru ada untuk WebSocket)
+RACE CONDITIONS 🟡
+Signal Session Manager: active_sessions dictionary mutation dalam _emit_event - bisa crash jika handler modifies session during iteration
+Two-phase cache: Sudah ada _cache_lock, tapi session cleanup di _on_session_end_handler bisa race dengan incoming signal checks
+4. MEMORY LEAKS & CLEANUP 🔧
+Active Dashboards: Dict tidak auto-cleanup jika dashboard task fails - bisa accumulate dead entries
+Chart Generator: Thread pool executor tidak ada graceful shutdown - resource leak on bot restart
+Signal Cache: Expired entries cleared only on new signal check - inactive users akan keep expired entries
+5. MONITORING & OBSERVABILITY 📊
+Sentry Integration: Hanya pada critical errors, tidak ada performance metrics tracking
+Health Check: Basic status only, tidak monitor cache health atau position count
+Logging: Tidak ada rate-limiting untuk logs - bisa spam disk pada high-frequency signals
+DATA CONSISTENCY 🔐
+Trade/Position Creation: Database commit sebelum _confirm_signal_sent - bisa divergence jika Telegram send gagal
+Multi-user Concurrent Signals: Tidak ada transaction-level locking antara berbagai users
+Session Cleanup: Chart deletion tidak atomic dengan session end - orphan files bisa tertinggal
+7. CONFIGURATION & DEPLOYMENT ⚙️
+Koyeb Compatibility: FREE_TIER_MODE=true tapi tidak ada graceful degradation jika OOM
+Port Binding: Hard-coded port 5000 - tidak flexible untuk scaled deployments
+Webhook Mode: Auto-detection mechanism ada tapi tidak ada fallback ke polling
+PRIORITAS PERBAIKAN (berdasarkan risk & impact):
+🔴 HIGH: Race condition di session cleanup + incoming signals
+🔴 HIGH: Database transaction isolation untuk concurrent users
+🟡 MEDIUM: Memory leak di thread pool executor & active dashboards
+🟡 MEDIUM: Retry mechanism untuk failed Telegram sends
+🟢 LOW: Performance monitoring & metrics tracking

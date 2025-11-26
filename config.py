@@ -62,6 +62,7 @@ class Config:
     FREE_TIER_MODE = os.getenv('FREE_TIER_MODE', 'true').lower() == 'true'
     TICK_LOG_SAMPLE_RATE = _get_int_env('TICK_LOG_SAMPLE_RATE', '30')
     AUTHORIZED_USER_IDS = _parse_user_ids(os.getenv('AUTHORIZED_USER_IDS', ''))
+    ID_USER_PUBLIC = _parse_user_ids(os.getenv('ID_USER_PUBLIC', ''))
     EMA_PERIODS = _parse_int_list(os.getenv('EMA_PERIODS', '5,10,20'), [5, 10, 20])
     EMA_PERIODS_LONG = _parse_int_list(os.getenv('EMA_PERIODS_LONG', '50'), [50])
     

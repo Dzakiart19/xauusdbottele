@@ -1,7 +1,7 @@
 # XAUUSD Trading Bot Pro V2
 
 ## Overview
-This project is an automated XAUUSD trading bot accessible via Telegram. It provides real-time trading signals, automatic position tracking, and trade outcome notifications. The bot offers 24/7 unlimited signals, robust risk management, and a database for performance tracking. It includes a premium subscription system and features advanced chart generation with technical indicators. The bot employs a refined dual-mode strategy (Auto/Manual signals) incorporating advanced filtering with Twin Range Filter (TRF) and Market Bias CEREBR, along with a Trend-Plus-Pullback strategy for enhanced precision and opportunity, aiming to be a professional and informative trading assistant for XAUUSD.
+This project is an automated XAUUSD trading bot accessible via Telegram. It provides real-time trading signals, automatic position tracking, and trade outcome notifications. The bot offers 24/7 unlimited signals, robust risk management, and a database for performance tracking. It is a private bot with access control via authorized user IDs and features advanced chart generation with technical indicators. The bot employs a refined dual-mode strategy (Auto/Manual signals) incorporating advanced filtering with Twin Range Filter (TRF) and Market Bias CEREBR, along with a Trend-Plus-Pullback strategy for enhanced precision and opportunity, aiming to be a professional and informative trading assistant for XAUUSD.
 
 ## User Preferences
 - Bahasa komunikasi: **Bahasa Indonesia** (100% tidak ada bahasa Inggris)
@@ -9,11 +9,10 @@ This project is an automated XAUUSD trading bot accessible via Telegram. It prov
 - Trading pair: **XAUUSD** (Gold)
 - Notifikasi: **Telegram** dengan foto chart + indikator
 - Tracking: **Real-time** sampai TP/SL
-- Mode: **24/7 unlimited** untuk admin/premium
+- Mode: **24/7 unlimited** untuk user terdaftar
 - Akurasi: Strategi multi-indicator dengan validasi ketat
 - Chart: Menampilkan indikator EMA, RSI, Stochastic (tidak polos)
-- Sistem Premium: Paket mingguan (Rp 15.000) dan bulanan (Rp 30.000)
-- Kontak untuk langganan: @dzeckyete
+- Akses Bot: **Privat** - hanya untuk user yang terdaftar di AUTHORIZED_USER_IDS atau ID_USER_PUBLIC
 
 ## System Architecture
 The bot's architecture is modular, designed for scalability and maintainability.
@@ -27,7 +26,7 @@ The bot's architecture is modular, designed for scalability and maintainability.
 - **Chart Generator:** Creates professional charts with integrated technical indicators.
 - **Risk Manager:** Calculates lot sizes, P/L, and enforces per-user risk limits (e.g., fixed SL, dynamic TP, daily loss limit, signal cooldown).
 - **Database:** SQLite for persistent data, with PostgreSQL support and auto-migration.
-- **User Manager:** Handles user authentication, subscription, and premium access control.
+- **User Manager:** Handles user authentication and access control via AUTHORIZED_USER_IDS and ID_USER_PUBLIC.
 - **Resilience:** Implements CircuitBreaker for WebSocket, global rate limiting for Telegram API, and retry mechanisms.
 - **System Health:** Includes port conflict detection, bot instance locking, and Sentry integration.
 
@@ -41,9 +40,9 @@ The bot's architecture is modular, designed for scalability and maintainability.
 **Technical Implementations & Feature Specifications:**
 - **Indicators:** EMA (5, 10, 20, 50), RSI (14 with 20-bar history), Stochastic (K=14, D=3), ATR (14), MACD (12,26,9), Volume, Twin Range Filter, Market Bias CEREBR.
 - **Risk Management:** Fixed SL ($1 per trade), dynamic TP (1.45x-2.50x R:R), max spread (5 pips), signal cooldown (120s per user), daily loss limit (3% per user), risk per trade (0.5%). Includes dynamic SL tightening and trailing stop activation.
-- **Subscription System:** Weekly and Monthly premium packages with automatic expiry.
-- **Admin Commands:** `/riset`, `/addpremium`, `/status`, `/tasks`, `/analytics`, `/systemhealth`.
-- **User Commands:** `/premium`, `/beli`, `/langganan`.
+- **Access Control:** Private bot with dual-tier access (AUTHORIZED_USER_IDS for admins, ID_USER_PUBLIC for public users).
+- **Admin Commands:** `/riset`, `/status`, `/tasks`, `/analytics`, `/systemhealth`.
+- **User Commands:** `/start`, `/help`, `/monitor`, `/getsignal`, `/status`, `/riwayat`, `/performa`.
 - **Anti-Duplicate Protection:** Two-phase cache pattern for race-condition-safe signal deduplication:
   - **Phase 1 (pending):** Atomically check duplicate and set pending status with `_cache_lock`
   - **Phase 2 (confirmed):** Upgrade to confirmed status only after Telegram send succeeds
@@ -71,6 +70,10 @@ The bot's architecture is modular, designed for scalability and maintainability.
 - **Sentry:** For advanced error tracking and monitoring (optional).
 
 ## Recent Changes (2025-11-26)
+- **Converted to Private Bot:** Removed premium/subscription system, now uses AUTHORIZED_USER_IDS (admin) and ID_USER_PUBLIC (public users) for access control
+- **Removed Commands:** /langganan, /premium, /beli, /addpremium (no longer applicable)
+- **Simplified User Manager:** Removed is_premium, upgrade_subscription, get_subscription_status, extend_subscription functions
+- **Updated Messages:** All access denied messages now indicate private bot status instead of subscription prompts
 - **Two-Phase Anti-Duplicate Signal Cache:** Implemented race-condition-safe signal deduplication with pending→confirmed status transitions and automatic rollback
 - **Optimized Chart Cleanup for Koyeb:** Reduced max charts from 30 to 10, cleanup interval from 10 to 5 minutes, auto-delete charts older than 30 minutes
 - **Async Lock Protection:** Single `asyncio.Lock()` guards all cache operations (`_check_and_set_pending`, `_confirm_signal_sent`, `_rollback_signal_cache`, `_clear_signal_cache`)
