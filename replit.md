@@ -107,3 +107,91 @@ The bot's architecture is modular, designed for scalability and maintainability.
 ### Background Tasks Integration
 - **Startup:** Background cleanup tasks started after Telegram bot initialization
 - **Shutdown:** Proper cancellation and cleanup of background tasks before shutdown
+
+## Latest Improvements (2025-11-26 - Hardening Update)
+
+### CRITICAL Priority Fixes
+
+#### bot/telegram_bot.py - Signal Cache & Chart Cleanup
+- **TTL-backed Signal Cache:** Implemented time decay with different TTLs for pending (60s) vs confirmed (120s) entries
+- **Async Cleanup Sweeper:** Background task `_pending_chart_cleanup_loop()` for automatic cleanup
+- **Telemetry Counters:** Added `_cache_telemetry` tracking hits, misses, rollbacks, expired cleanups
+- **Pending Chart Eviction:** Added `register_pending_chart()`, `confirm_chart_sent()`, `evict_pending_chart()` methods
+- **Chart Integration:** Registered eviction callbacks with SignalSessionManager and ChartGenerator
+
+#### bot/market_data.py - WebSocket Recovery & NaN Handling
+- **Connection State Machine:** Added `ConnectionState` enum (DISCONNECTED, CONNECTING, CONNECTED, RECONNECTING)
+- **Exponential Backoff with Jitter:** Decorrelated jitter algorithm for better distribution
+- **ConnectionMetrics:** Tracking connections, reconnects, durations, state transition history
+- **Pub/Sub Cleanup:** Added `cleanup_stale_subscribers()` and `_unsubscribe_all()` methods
+- **NaN Scrubbing:** Added `is_valid_price()`, `sanitize_price_data()`, `_scrub_nan_prices()` at all boundaries
+
+#### main.py - Graceful Shutdown & Task Registry
+- **Task Registry:** Added `TaskInfo`, `TaskPriority`, `TaskStatus` for tracking all long-lived tasks
+- **Shielded Cancellation:** `_cancel_task_with_shield()` for critical tasks during shutdown
+- **Proper Shutdown Sequence:** MarketData → Telegram → Scheduler → PositionTracker → HTTPServer → DB
+- **Signal Handlers:** Thread-safe double-shutdown prevention with force exit after 3 signals
+
+### HIGH Priority Fixes
+
+#### bot/position_tracker.py - Task Lifecycle Tracking
+- **Completion Event:** Added `_completion_event` (asyncio.Event) for tracking task completion
+- **Wait for Completion:** `wait_for_completion(timeout)` method to wait for all pending tasks
+- **Done Callbacks:** `_on_task_done()` drains exceptions and resolves SignalSessionManager states
+
+#### bot/task_scheduler.py - Background Task Callbacks
+- **Exception Draining:** `_on_task_done()` callback for exception logging
+- **Flush Pending Tasks:** `flush_pending_tasks(timeout=15)` for graceful shutdown
+- **Task Tracking:** Added `_task_exceptions` dict to track exceptions across task lifecycle
+
+#### bot/database.py - Connection Pooling & Rollback Safety
+- **QueuePool Configuration:** POOL_SIZE=5, MAX_OVERFLOW=10, POOL_TIMEOUT=30, POOL_RECYCLE=3600
+- **Pool Event Listeners:** Monitoring checkout, checkin, connect, close events
+- **Safe Session:** `safe_session()` context manager with guaranteed rollback and closure
+- **Pool Status:** `get_pool_status()` and `log_pool_status()` for monitoring
+
+#### bot/user_manager.py - Thread-Safe Concurrent Updates
+- **Per-User Locks:** `_user_locks: Dict[int, RLock]` via defaultdict
+- **Lock Context Manager:** `user_lock(telegram_id)` for clean lock handling
+- **Active Users Guard:** `_active_users_lock` for mutations
+- **Stale Lock Cleanup:** `clear_stale_locks()` for memory management
+
+### MEDIUM Priority Fixes
+
+#### bot/strategy.py - NaN/Inf/Negative Price Handling
+- **PriceDataValidator:** Centralized safe_number pipeline
+- **ValidationResult:** Dataclass for validation results
+- **validate_price_data():** Helper for OHLCV validation with short-circuit
+
+#### bot/utils.py - Recursive Depth Limits & LRU Cache
+- **RecursionGuard:** Helper class with max depth counters and thread-safety
+- **TunedLRUCache:** Class with size/time metrics and eviction logging
+- **@with_recursion_guard:** Decorator for easy function protection
+
+#### bot/error_handler.py - Exception Categorization
+- **ErrorContext:** Rich context class with traceback capture
+- **ExceptionCategory:** 20+ categories with pattern mappings
+- **Structured Payloads:** `to_dict()` and `to_structured_payload()` for serialization
+
+#### bot/alert_system.py - History Cleanup & Queue Persistence
+- **Queue Persistence:** `save_queue_state()` and `restore_queue_state()` via JSON
+- **Rate Limiter State:** Serialization for surviving resets
+- **Periodic Cleanup:** `periodic_history_cleanup_with_backoff()` with exponential backoff
+
+### LOW Priority Fixes
+
+#### bot/indicators.py - Null Check Safety
+- **validate_series():** Validates and sanitizes pandas Series
+- **safe_divide():** Handles division by zero and NaN
+- **_validate_dataframe():** Validates DataFrame columns and data
+
+#### config.py - Configuration Validation Strictness
+- **ConfigError:** Enhanced exception with errors/warnings lists
+- **Validation Helpers:** `_validate_type()`, `_validate_range()`, `_validate_positive()`, etc.
+- **Strict Mode:** `validate(strict=True)` for comprehensive checks
+
+#### bot/logger.py - Log Rotation & Disk Cleanup
+- **Retention Policy:** 5MB per file, 5 backups, 7 days retention
+- **Module-Specific Config:** LOG_CONFIG with custom settings per module
+- **cleanup_old_logs():** Removes old, empty, and excess backup files
+- **get_log_statistics():** Returns detailed log file statistics
