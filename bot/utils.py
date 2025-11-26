@@ -147,7 +147,7 @@ def with_recursion_guard(max_depth: int = 100, name: Optional[str] = None):
             with guard:
                 return func(*args, **kwargs)
         
-        wrapper._recursion_guard = guard
+        setattr(wrapper, '_recursion_guard', guard)
         return wrapper
     
     return decorator
@@ -511,7 +511,7 @@ def cleanup_files(directory: str, pattern: str = '*', days_old: int = 7,
         now = datetime.now()
         
         if recursive:
-            dirs_to_process = [(directory, 0)]
+            dirs_to_process: List[tuple[str, int]] = [(directory, 0)]
             
             while dirs_to_process:
                 current_dir, current_depth = dirs_to_process.pop(0)

@@ -119,25 +119,25 @@ class TradingAnalytics:
                 }
             
             total_trades = len(trades)
-            wins = [t for t in trades if t.actual_pl > 0]
-            losses = [t for t in trades if t.actual_pl <= 0]
+            wins = [t for t in trades if t.actual_pl is not None and cast(float, t.actual_pl) > 0]
+            losses = [t for t in trades if t.actual_pl is not None and cast(float, t.actual_pl) <= 0]
             
             win_count = len(wins)
             loss_count = len(losses)
             
             winrate = (win_count / total_trades * 100) if total_trades > 0 else 0.0
             
-            total_pl = sum(t.actual_pl for t in trades)
+            total_pl = sum(cast(float, t.actual_pl) for t in trades if t.actual_pl is not None)
             avg_pl = total_pl / total_trades if total_trades > 0 else 0.0
             
-            total_wins = sum(t.actual_pl for t in wins)
-            total_losses = abs(sum(t.actual_pl for t in losses))
+            total_wins = sum(cast(float, t.actual_pl) for t in wins if t.actual_pl is not None)
+            total_losses = abs(sum(cast(float, t.actual_pl) for t in losses if t.actual_pl is not None))
             
             avg_win = total_wins / win_count if win_count > 0 else 0.0
             avg_loss = total_losses / loss_count if loss_count > 0 else 0.0
             
-            largest_win = max((t.actual_pl for t in wins), default=0.0)
-            largest_loss = min((t.actual_pl for t in losses), default=0.0)
+            largest_win = max((cast(float, t.actual_pl) for t in wins if t.actual_pl is not None), default=0.0)
+            largest_loss = min((cast(float, t.actual_pl) for t in losses if t.actual_pl is not None), default=0.0)
             
             profit_factor = (total_wins / total_losses) if total_losses > 0 else 0.0
             
@@ -145,14 +145,14 @@ class TradingAnalytics:
                 'total_trades': total_trades,
                 'wins': win_count,
                 'losses': loss_count,
-                'winrate': round(winrate, 2),
-                'total_pl': round(total_pl, 2),
-                'avg_pl': round(avg_pl, 2),
-                'avg_win': round(avg_win, 2),
-                'avg_loss': round(avg_loss, 2),
-                'largest_win': round(largest_win, 2),
-                'largest_loss': round(largest_loss, 2),
-                'profit_factor': round(profit_factor, 2),
+                'winrate': round(float(winrate), 2),
+                'total_pl': round(float(total_pl), 2),
+                'avg_pl': round(float(avg_pl), 2),
+                'avg_win': round(float(avg_win), 2),
+                'avg_loss': round(float(avg_loss), 2),
+                'largest_win': round(float(largest_win), 2),
+                'largest_loss': round(float(largest_loss), 2),
+                'profit_factor': round(float(profit_factor), 2),
                 'period_days': days
             }
             
@@ -202,14 +202,15 @@ class TradingAnalytics:
             })
             
             for trade in trades:
-                if trade.signal_time:
+                if trade.signal_time is not None:
                     jakarta_time = trade.signal_time.astimezone(jakarta_tz)
                     hour = jakarta_time.hour
                     
                     hourly_stats[hour]['trades'] += 1
-                    hourly_stats[hour]['total_pl'] += trade.actual_pl
+                    if trade.actual_pl is not None:
+                        hourly_stats[hour]['total_pl'] += cast(float, trade.actual_pl)
                     
-                    if trade.actual_pl > 0:
+                    if trade.actual_pl is not None and cast(float, trade.actual_pl) > 0:
                         hourly_stats[hour]['wins'] += 1
                     else:
                         hourly_stats[hour]['losses'] += 1
@@ -271,8 +272,8 @@ class TradingAnalytics:
             
             trades = query.all()
             
-            auto_trades = [t for t in trades if t.signal_source == 'auto']
-            manual_trades = [t for t in trades if t.signal_source == 'manual']
+            auto_trades = [t for t in trades if t.signal_source is not None and str(t.signal_source) == 'auto']
+            manual_trades = [t for t in trades if t.signal_source is not None and str(t.signal_source) == 'manual']
             
             def calculate_stats(trade_list: List[Trade]) -> Dict[str, Any]:
                 if not trade_list:
@@ -371,19 +372,20 @@ class TradingAnalytics:
             profit_captured_ratios = []
             
             for pos in positions:
-                if pos.opened_at and pos.closed_at:
+                if pos.opened_at is not None and pos.closed_at is not None:
                     hold_time = (pos.closed_at - pos.opened_at).total_seconds() / 60
                     hold_times.append(hold_time)
                 
                 if pos.max_profit_reached is not None:
-                    max_profits.append(pos.max_profit_reached)
+                    max_profit_val = cast(float, pos.max_profit_reached)
+                    max_profits.append(max_profit_val)
                     
-                    if pos.unrealized_pl is not None and pos.max_profit_reached > 0:
-                        capture_ratio = (pos.unrealized_pl / pos.max_profit_reached * 100)
+                    if pos.unrealized_pl is not None and max_profit_val > 0:
+                        capture_ratio = (cast(float, pos.unrealized_pl) / max_profit_val * 100)
                         profit_captured_ratios.append(capture_ratio)
                 
                 if pos.sl_adjustment_count is not None:
-                    sl_adjustments.append(pos.sl_adjustment_count)
+                    sl_adjustments.append(cast(int, pos.sl_adjustment_count))
             
             avg_hold_time = sum(hold_times) / len(hold_times) if hold_times else 0.0
             avg_max_profit = sum(max_profits) / len(max_profits) if max_profits else 0.0
@@ -452,8 +454,8 @@ class TradingAnalytics:
             
             total_trades = len(trades)
             
-            tp_hits = sum(1 for t in trades if t.result == 'WIN')
-            sl_hits = sum(1 for t in trades if t.result == 'LOSS')
+            tp_hits = sum(1 for t in trades if t.result is not None and str(t.result) == 'WIN')
+            sl_hits = sum(1 for t in trades if t.result is not None and str(t.result) == 'LOSS')
             
             tp_hit_rate = (tp_hits / total_trades * 100) if total_trades > 0 else 0.0
             sl_hit_rate = (sl_hits / total_trades * 100) if total_trades > 0 else 0.0
@@ -462,22 +464,26 @@ class TradingAnalytics:
             actual_rr_ratios = []
             
             for trade in trades:
-                if trade.entry_price and trade.stop_loss and trade.take_profit:
-                    sl_distance = abs(trade.entry_price - trade.stop_loss)
-                    tp_distance = abs(trade.entry_price - trade.take_profit)
+                if trade.entry_price is not None and trade.stop_loss is not None and trade.take_profit is not None:
+                    entry = cast(float, trade.entry_price)
+                    sl = cast(float, trade.stop_loss)
+                    tp = cast(float, trade.take_profit)
+                    sl_distance = abs(entry - sl)
+                    tp_distance = abs(entry - tp)
                     
                     if sl_distance > 0:
                         planned_rr = tp_distance / sl_distance
                         planned_rr_ratios.append(planned_rr)
                     
                     if trade.actual_pl is not None and sl_distance > 0:
-                        if trade.signal_type == 'BUY':
+                        actual_pl_val = cast(float, trade.actual_pl)
+                        if trade.signal_type is not None and str(trade.signal_type) == 'BUY':
                             risk = sl_distance * (self.config.LOT_SIZE if self.config else 0.01) * (self.config.XAUUSD_PIP_VALUE if self.config else 10.0)
                         else:
                             risk = sl_distance * (self.config.LOT_SIZE if self.config else 0.01) * (self.config.XAUUSD_PIP_VALUE if self.config else 10.0)
                         
                         if risk > 0:
-                            actual_rr = trade.actual_pl / risk if trade.actual_pl > 0 else -(abs(trade.actual_pl) / risk)
+                            actual_rr = actual_pl_val / risk if actual_pl_val > 0 else -(abs(actual_pl_val) / risk)
                             actual_rr_ratios.append(actual_rr)
             
             avg_planned_rr = sum(planned_rr_ratios) / len(planned_rr_ratios) if planned_rr_ratios else 0.0
@@ -585,8 +591,8 @@ class TradingAnalytics:
                         trade.take_profit,
                         trade.actual_pl,
                         trade.result,
-                        trade.signal_time.isoformat() if trade.signal_time else '',
-                        trade.close_time.isoformat() if trade.close_time else '',
+                        trade.signal_time.isoformat() if trade.signal_time is not None else '',
+                        trade.close_time.isoformat() if trade.close_time is not None else '',
                         trade.timeframe,
                         trade.spread
                     ])

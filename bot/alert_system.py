@@ -357,10 +357,7 @@ class AlertSystem:
     def _remove_processed_alert(self, alert: Alert):
         """Remove processed alert from queue."""
         try:
-            new_queue = deque(
-                [a for a in self.alert_queue if a is not alert],
-                maxlen=MAX_QUEUE_SIZE
-            )
+            new_queue = [a for a in self.alert_queue if a is not alert]
             self.alert_queue = new_queue
         except Exception as e:
             logger.error(f"Error removing processed alert from queue: {e}")
@@ -724,11 +721,11 @@ class AlertSystem:
         """Serialize rate limiter state for persistence"""
         try:
             state = self.rate_limiter.get_state()
-            if hasattr(self.rate_limiter, '_calls'):
-                state['calls'] = [
-                    ts.isoformat() if isinstance(ts, datetime) else str(ts)
-                    for ts in getattr(self.rate_limiter, '_calls', [])
-                ]
+            call_times = self.rate_limiter.get_call_times()
+            state['calls'] = [
+                ts.isoformat() if isinstance(ts, datetime) else str(ts)
+                for ts in call_times
+            ]
             return state
         except Exception as e:
             logger.warning(f"Could not serialize rate limiter state: {e}")
@@ -740,16 +737,17 @@ class AlertSystem:
             if not state:
                 return
             
-            if hasattr(self.rate_limiter, '_calls') and 'calls' in state:
+            if 'calls' in state:
                 restored_calls = []
+                time_window = self.rate_limiter.get_time_window()
                 for ts_str in state.get('calls', []):
                     try:
                         dt = datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
-                        if (datetime.now(pytz.UTC) - dt).total_seconds() < self.rate_limiter._time_window:
+                        if (datetime.now(pytz.UTC) - dt).total_seconds() < time_window:
                             restored_calls.append(dt)
                     except Exception:
                         pass
-                self.rate_limiter._calls = restored_calls
+                self.rate_limiter.set_call_times(restored_calls)
                 logger.debug(f"Restored {len(restored_calls)} rate limiter calls")
                 
         except Exception as e:

@@ -305,3 +305,17 @@ class RateLimiter:
             'remaining': self.get_remaining(),
             'wait_time': self.get_wait_time()
         }
+    
+    def get_time_window(self) -> float:
+        """Get time window in seconds (public accessor)"""
+        return self.time_window
+    
+    def get_call_times(self) -> list:
+        """Get list of call timestamps (public accessor, returns copy)"""
+        return list(self.call_times)
+    
+    def set_call_times(self, call_times: list):
+        """Set call times from restored state (public accessor)"""
+        self.call_times.clear()
+        for ts in call_times:
+            self.call_times.append(ts)

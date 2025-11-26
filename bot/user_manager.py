@@ -25,43 +25,43 @@ from contextlib import contextmanager
 import threading
 import pytz
 from bot.logger import setup_logger
-from sqlalchemy import Column, Integer, String, DateTime, Boolean, Float, create_engine
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, scoped_session
+from sqlalchemy import Integer, String, DateTime, Boolean, Float, create_engine
+from sqlalchemy.orm import sessionmaker, scoped_session, Mapped, mapped_column, DeclarativeBase
 
 logger = setup_logger('UserManager')
 
-Base = declarative_base()
+class Base(DeclarativeBase):
+    pass
 
 class User(Base):
     __tablename__ = 'users'
     
-    id = Column(Integer, primary_key=True)
-    telegram_id = Column(Integer, unique=True, nullable=False)
-    username = Column(String(100))
-    first_name = Column(String(100))
-    last_name = Column(String(100))
-    is_active = Column(Boolean, default=True)
-    is_admin = Column(Boolean, default=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    last_active = Column(DateTime, default=datetime.utcnow)
-    total_trades = Column(Integer, default=0)
-    total_profit = Column(Float, default=0.0)
-    subscription_tier = Column(String(20), default='FREE')
-    subscription_expires = Column(DateTime)
-    settings = Column(String(500))
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    telegram_id: Mapped[int] = mapped_column(Integer, unique=True, nullable=False)
+    username: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    first_name: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    last_name: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    is_admin: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    last_active: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    total_trades: Mapped[int] = mapped_column(Integer, default=0)
+    total_profit: Mapped[float] = mapped_column(Float, default=0.0)
+    subscription_tier: Mapped[str] = mapped_column(String(20), default='FREE')
+    subscription_expires: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    settings: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
 
 class UserPreferences(Base):
     __tablename__ = 'user_preferences'
     
-    id = Column(Integer, primary_key=True)
-    telegram_id = Column(Integer, unique=True, nullable=False)
-    notification_enabled = Column(Boolean, default=True)
-    daily_summary_enabled = Column(Boolean, default=True)
-    risk_alerts_enabled = Column(Boolean, default=True)
-    preferred_timeframe = Column(String(10), default='M1')
-    max_daily_signals = Column(Integer, default=999999)
-    timezone = Column(String(50), default='Asia/Jakarta')
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    telegram_id: Mapped[int] = mapped_column(Integer, unique=True, nullable=False)
+    notification_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    daily_summary_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    risk_alerts_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    preferred_timeframe: Mapped[str] = mapped_column(String(10), default='M1')
+    max_daily_signals: Mapped[int] = mapped_column(Integer, default=999999)
+    timezone: Mapped[str] = mapped_column(String(50), default='Asia/Jakarta')
 
 class UserManager:
     """Thread-safe user manager with per-user locking.
@@ -149,7 +149,7 @@ class UserManager:
                 logger.error(f"Error removing scoped session: {remove_error}")
     
     def create_user(self, telegram_id: int, username: Optional[str] = None,
-                   first_name: Optional[str] = None, last_name: Optional[str] = None) -> User:
+                   first_name: Optional[str] = None, last_name: Optional[str] = None) -> Optional[User]:
         """Create a new user with per-user locking (WRITE operation).
         
         Thread-safe: Acquires per-user lock before modification.
@@ -215,7 +215,7 @@ class UserManager:
         with self.get_session() as session:
             try:
                 user = session.query(User).filter(User.username == username).first()
-                return user.telegram_id if user else None
+                return int(user.telegram_id) if user else None
             except Exception as e:
                 logger.error(f"Error getting user by username: {e}")
                 return None
@@ -249,7 +249,7 @@ class UserManager:
     def is_admin(self, telegram_id: int) -> bool:
         """Check if user is admin (READ operation - no lock needed)."""
         user = self.get_user(telegram_id)
-        return user.is_admin if user else False
+        return bool(user.is_admin) if user else False
     
     def get_all_users(self) -> List[User]:
         """Get all users (READ operation - no lock needed)."""
